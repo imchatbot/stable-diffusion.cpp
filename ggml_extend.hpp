@@ -1325,6 +1325,7 @@ public:
             tensors[prefix + pair.first] = pair.second;
         }
     }
+
 };
 
 class UnaryBlock : public GGMLBlock {

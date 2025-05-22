@@ -15,10 +15,12 @@
 #include "pmid.hpp"
 #include "tae.hpp"
 #include "vae.hpp"
+#include "t5.hpp" // For T5Embedder
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
 #include "stb_image.h"
+#include "chroma.hpp"
 
 // #define STB_IMAGE_WRITE_IMPLEMENTATION
 // #define STB_IMAGE_WRITE_STATIC
@@ -98,6 +100,7 @@ public:
     std::shared_ptr<PhotoMakerIDEncoder> pmid_model;
     std::shared_ptr<LoraModel> pmid_lora;
     std::shared_ptr<PhotoMakerIDEmbed> pmid_id_embeds;
+    std::shared_ptr<T5Embedder> t5_model; // For Chroma
 
     std::string taesd_path;
     bool use_tiny_autoencoder = false;
@@ -313,7 +316,7 @@ public:
         } else {
             clip_backend   = backend;
             bool use_t5xxl = false;
-            if (sd_version_is_dit(version)) {
+            if (sd_version_is_dit(version) || sd_version_is_chroma(version)) {
                 use_t5xxl = true;
             }
             if (!ggml_backend_is_cpu(backend) && use_t5xxl && conditioner_wtype != GGML_TYPE_F32) {
@@ -336,7 +339,16 @@ public:
             } else if (sd_version_is_flux(version)) {
                 cond_stage_model = std::make_shared<FluxCLIPEmbedder>(clip_backend, model_loader.tensor_storages_types);
                 diffusion_model  = std::make_shared<FluxModel>(backend, model_loader.tensor_storages_types, version, diffusion_flash_attn);
-            } else {
+            } else if (sd_version_is_chroma(version)) {
+                t5_model = std::make_shared<T5Embedder>(clip_backend, model_loader.tensor_storages_types, "text_encoders.t5xxl.transformer.");
+                t5_model->alloc_params_buffer();
+                t5_model->get_param_tensors(tensors, "text_encoders.t5xxl.transformer.");
+                // For Chroma, cond_stage_model will be handled differently, possibly directly using t5_model
+                // For now, we'll keep cond_stage_model as a placeholder or null if not needed for other parts.
+                // The plan states "Load Text Encoder: Implement the logic within the ChromaRunner or a related structure to load the T5 XXL text encoder model weights from the GGUF file."
+                // This means the T5Embedder should be loaded here.
+            }
+            else {
                 if (id_embeddings_path.find("v2") != std::string::npos) {
                     cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, model_loader.tensor_storages_types, embeddings_path, version, PM_VERSION_2);
                 } else {
@@ -1351,14 +1363,38 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     }
 
     // Get learned condition
-    t0               = ggml_time_ms();
-    SDCondition cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                           sd_ctx->sd->n_threads,
-                                                                           prompt,
-                                                                           clip_skip,
-                                                                           width,
-                                                                           height,
-                                                                           sd_ctx->sd->diffusion_model->get_adm_in_channels());
+    t0 = ggml_time_ms();
+    SDCondition cond;
+    if (sd_version_is_chroma(sd_ctx->sd->version)) {
+        // For Chroma, use T5Embedder
+        auto tokens_and_weights = sd_ctx->sd->t5_model->tokenize(prompt, 77, true); // max_length 77, padding true
+        std::vector<int>& tokens = tokens_and_weights.first;
+        // std::vector<float>& weights = tokens_and_weights.second; // Weights are not used for T5 embeddings directly
+
+        // Encode text input using T5 model
+
+        ggml_tensor* input_ids = vector_to_ggml_tensor_i32(work_ctx, tokens);
+        ggml_tensor* t5_embeddings = NULL;
+        sd_ctx->sd->t5_model->model.compute(sd_ctx->sd->n_threads, input_ids, &t5_embeddings, work_ctx);
+
+        // Generate T5 padding mask
+        // The image sequence length for Chroma is 256 (16x16 patches from 256x256 latent)
+        // The number of heads for T5 XXL is 64 (from chroma_integration_plan.md)
+        ggml_tensor* t5_padding_mask = Chroma::generate_t5_padding_mask_ggml(work_ctx, tokens, 256, 64);
+
+        cond.c_crossattn = t5_embeddings;
+        cond.c_concat = t5_padding_mask; // Store padding mask in c_concat for now, will be passed to UNet
+        cond.c_vector = NULL; // Not used for Chroma text conditioning
+    } else {
+        // Existing logic for other models
+        cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                   sd_ctx->sd->n_threads,
+                                                                   prompt,
+                                                                   clip_skip,
+                                                                   width,
+                                                                   height,
+                                                                   sd_ctx->sd->diffusion_model->get_adm_in_channels());
+    }
 
     SDCondition uncond;
     if (cfg_scale != 1.0) {
@@ -1366,14 +1402,30 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
         if (sd_version_is_sdxl(sd_ctx->sd->version) && negative_prompt.size() == 0) {
             force_zero_embeddings = true;
         }
-        uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                     sd_ctx->sd->n_threads,
-                                                                     negative_prompt,
-                                                                     clip_skip,
-                                                                     width,
-                                                                     height,
-                                                                     sd_ctx->sd->diffusion_model->get_adm_in_channels(),
-                                                                     force_zero_embeddings);
+        if (sd_version_is_chroma(sd_ctx->sd->version)) {
+            // For Chroma, use T5Embedder for negative prompt
+            auto neg_tokens_and_weights = sd_ctx->sd->t5_model->tokenize(negative_prompt, 77, true);
+            std::vector<int>& neg_tokens = neg_tokens_and_weights.first;
+
+            ggml_tensor* neg_input_ids = vector_to_ggml_tensor_i32(work_ctx, neg_tokens);
+            ggml_tensor* neg_t5_embeddings = NULL;
+            sd_ctx->sd->t5_model->model.compute(sd_ctx->sd->n_threads, neg_input_ids, &neg_t5_embeddings, work_ctx);
+
+            ggml_tensor* neg_t5_padding_mask = Chroma::generate_t5_padding_mask_ggml(work_ctx, neg_tokens, 256, 64);
+
+            uncond.c_crossattn = neg_t5_embeddings;
+            uncond.c_concat = neg_t5_padding_mask;
+            uncond.c_vector = NULL;
+        } else {
+            uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                         sd_ctx->sd->n_threads,
+                                                                         negative_prompt,
+                                                                         clip_skip,
+                                                                         width,
+                                                                         height,
+                                                                         sd_ctx->sd->diffusion_model->get_adm_in_channels(),
+                                                                         force_zero_embeddings);
+        }
     }
     t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
