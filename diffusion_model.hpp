@@ -187,7 +187,7 @@ struct ChromaModel : public DiffusionModel {
                 std::map<std::string, enum ggml_type>& tensor_types,
                 SDVersion version = VERSION_CHROMA,
                 bool flash_attn   = false)
-        : chroma(backend, tensor_types,flash_attn) {
+        : chroma(backend, tensor_types, "model.diffusion_model",flash_attn) {
     }
 
     void alloc_params_buffer() {

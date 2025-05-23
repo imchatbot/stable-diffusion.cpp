@@ -364,7 +364,7 @@ public:
                 diffusion_model  = std::make_shared<FluxModel>(backend, model_loader.tensor_storages_types, version, diffusion_flash_attn);
             } else if (sd_version_is_chroma(version)) {
                 cond_stage_model = std::make_shared<ChromaT5Embedder>(clip_backend, model_loader.tensor_storages_types);
-                diffusion_model  = std::make_shared<ChromaModel>(backend, model_loader.tensor_storages_types,version, diffusion_flash_attn);
+                diffusion_model  = std::make_shared<ChromaModel>(backend, model_loader.tensor_storages_types, version, diffusion_flash_attn);
             }
             else {
                 if (id_embeddings_path.find("v2") != std::string::npos) {
@@ -374,13 +374,15 @@ public:
                 }
                 diffusion_model = std::make_shared<UNetModel>(backend, model_loader.tensor_storages_types, version, diffusion_flash_attn);
             }
+         
             LOG_INFO("Allocating params buffer for cond_stage_model");
             cond_stage_model->alloc_params_buffer();
             cond_stage_model->get_param_tensors(tensors);
+         
             LOG_INFO("Allocating params buffer for diffusion_model");
             diffusion_model->alloc_params_buffer();
             diffusion_model->get_param_tensors(tensors);
-
+     
             if (!use_tiny_autoencoder) {
                 if (vae_on_cpu && !ggml_backend_is_cpu(backend)) {
                     LOG_INFO("VAE Autoencoder: Using CPU backend");
@@ -910,55 +912,41 @@ public:
 
             if (start_merge_step == -1 || step <= start_merge_step) {
                 // cond
-                if (sd_version_is_chroma(version)) {
-                    std::dynamic_pointer_cast<Chroma::ChromaRunner>(diffusion_model)->compute(n_threads,
-                                                                                              noised_input,
-                                                                                              timesteps,
-                                                                                              cond.c_crossattn, // T5 embeddings
-                                                                                              cond.c_concat,    // t5_padding_mask
-                                                                                              cond.c_vector,    // positional embeddings (pe)
-                                                                                              &out_cond,
-                                                                                              NULL,
-                                                                                              skip_layers);
-                } else {
-                    diffusion_model->compute(n_threads,
-                                             noised_input,
-                                             timesteps,
-                                             cond.c_crossattn,
-                                             cond.c_concat,
-                                             cond.c_vector,
-                                             guidance_tensor,
-                                             -1,
-                                             controls,
-                                             control_strength,
-                                             &out_cond);
-                }
+                LOG_DEBUG("Denoise lambda (cond pass): step %d, sigma: %f", step, sigma);
+                if (noised_input) LOG_DEBUG("  noised_input shape: %lld %lld %lld %lld, type: %s", noised_input->ne[0], noised_input->ne[1], noised_input->ne[2], noised_input->ne[3], ggml_type_name(noised_input->type)); else LOG_DEBUG("  noised_input is NULL");
+                if (timesteps) LOG_DEBUG("  timesteps shape: %lld, type: %s", timesteps->ne[0], ggml_type_name(timesteps->type)); else LOG_DEBUG("  timesteps is NULL");
+                if (cond.c_crossattn) LOG_DEBUG("  cond.c_crossattn shape: %lld %lld %lld %lld, type: %s", cond.c_crossattn->ne[0], cond.c_crossattn->ne[1], cond.c_crossattn->ne[2], cond.c_crossattn->ne[3], ggml_type_name(cond.c_crossattn->type)); else LOG_DEBUG("  cond.c_crossattn is NULL");
+                if (cond.c_concat) LOG_DEBUG("  cond.c_concat shape: %lld %lld %lld %lld, type: %s", cond.c_concat->ne[0], cond.c_concat->ne[1], cond.c_concat->ne[2], cond.c_concat->ne[3], ggml_type_name(cond.c_concat->type)); else LOG_DEBUG("  cond.c_concat is NULL");
+                if (cond.c_vector) LOG_DEBUG("  cond.c_vector shape: %lld %lld %lld %lld, type: %s", cond.c_vector->ne[0], cond.c_vector->ne[1], cond.c_vector->ne[2], cond.c_vector->ne[3], ggml_type_name(cond.c_vector->type)); else LOG_DEBUG("  cond.c_vector is NULL");
+                if (guidance_tensor) LOG_DEBUG("  guidance_tensor shape: %lld, type: %s", guidance_tensor->ne[0], ggml_type_name(guidance_tensor->type)); else LOG_DEBUG("  guidance_tensor is NULL");
+                // Remove the special case for Chroma - use standard DiffusionModel interface for ALL models
+                diffusion_model->compute(n_threads,
+                                        noised_input,
+                                        timesteps,
+                                        cond.c_crossattn, // T5 embeddings -> context
+                                        cond.c_concat,    // t5_padding_mask -> c_concat
+                                        cond.c_vector,    // positional embeddings -> c_vector
+                                        guidance_tensor,  // guidance (unused by Chroma)
+                                        -1,               // layer (unused by Chroma)
+                                        controls,         // controls (unused by Chroma)
+                                        control_strength, // control_strength (unused by Chroma)
+                                        &out_cond,
+                                        NULL,
+                                        skip_layers);
             } else {
-                if (sd_version_is_chroma(version)) {
-                    std::dynamic_pointer_cast<Chroma::ChromaRunner>(diffusion_model)->compute(n_threads,
-                                                                                              noised_input,
-                                                                                              timesteps,
-                                                                                              id_cond.c_crossattn, // T5 embeddings
-                                                                                              cond.c_concat,       // t5_padding_mask
-                                                                                              id_cond.c_vector,    // positional embeddings (pe)
-                                                                                              &out_cond,
-                                                                                              NULL,
-                                                                                              skip_layers);
-                } else {
-                    diffusion_model->compute(n_threads,
-                                             noised_input,
-                                             timesteps,
-                                             id_cond.c_crossattn,
-                                             cond.c_concat,
-                                             id_cond.c_vector,
-                                             guidance_tensor,
-                                             -1,
-                                             controls,
-                                             control_strength,
-                                             &out_cond);
-                }
+                diffusion_model->compute(n_threads,
+                                         noised_input,
+                                         timesteps,
+                                         cond.c_crossattn,
+                                         cond.c_concat,
+                                         cond.c_vector,
+                                         guidance_tensor,
+                                         -1,
+                                         controls,
+                                         control_strength,
+                                         &out_cond);
             }
-
+            
             float* negative_data = NULL;
             if (has_unconditioned) {
                 // uncond
@@ -966,29 +954,17 @@ public:
                     control_net->compute(n_threads, noised_input, control_hint, timesteps, uncond.c_crossattn, uncond.c_vector);
                     controls = control_net->controls;
                 }
-                if (sd_version_is_chroma(version)) {
-                    std::dynamic_pointer_cast<Chroma::ChromaRunner>(diffusion_model)->compute(n_threads,
-                                                                                              noised_input,
-                                                                                              timesteps,
-                                                                                              uncond.c_crossattn, // T5 embeddings
-                                                                                              uncond.c_concat,    // t5_padding_mask
-                                                                                              uncond.c_vector,    // positional embeddings (pe)
-                                                                                              &out_uncond,
-                                                                                              NULL,
-                                                                                              skip_layers);
-                } else {
-                    diffusion_model->compute(n_threads,
-                                             noised_input,
-                                             timesteps,
-                                             uncond.c_crossattn,
-                                             uncond.c_concat,
-                                             uncond.c_vector,
-                                             guidance_tensor,
-                                             -1,
-                                             controls,
-                                             control_strength,
-                                             &out_uncond);
-                }
+                diffusion_model->compute(n_threads,
+                                         noised_input,
+                                         timesteps,
+                                         uncond.c_crossattn,
+                                         uncond.c_concat,
+                                         uncond.c_vector,
+                                         guidance_tensor,
+                                         -1,
+                                         controls,
+                                         control_strength,
+                                         &out_uncond);
                 negative_data = (float*)out_uncond->data;
             }
 
@@ -998,31 +974,19 @@ public:
             if (is_skiplayer_step) {
                 LOG_DEBUG("Skipping layers at step %d\n", step);
                 // skip layer (same as conditionned)
-                if (sd_version_is_chroma(version)) {
-                    std::dynamic_pointer_cast<Chroma::ChromaRunner>(diffusion_model)->compute(n_threads,
-                                                                                              noised_input,
-                                                                                              timesteps,
-                                                                                              cond.c_crossattn, // T5 embeddings
-                                                                                              cond.c_concat,    // t5_padding_mask
-                                                                                              cond.c_vector,    // positional embeddings (pe)
-                                                                                              &out_skip,
-                                                                                              NULL,
-                                                                                              skip_layers);
-                } else {
-                    diffusion_model->compute(n_threads,
-                                             noised_input,
-                                             timesteps,
-                                             cond.c_crossattn,
-                                             cond.c_concat,
-                                             cond.c_vector,
-                                             guidance_tensor,
-                                             -1,
-                                             controls,
-                                             control_strength,
-                                             &out_skip,
-                                             NULL,
-                                             skip_layers);
-                }
+                diffusion_model->compute(n_threads,
+                                         noised_input,
+                                         timesteps,
+                                         cond.c_crossattn,
+                                         cond.c_concat,
+                                         cond.c_vector,
+                                         guidance_tensor,
+                                         -1,
+                                         controls,
+                                         control_strength,
+                                         &out_skip,
+                                         NULL,
+                                         skip_layers);
                 skip_layer_data = (float*)out_skip->data;
             }
             float* vec_denoised  = (float*)denoised->data;

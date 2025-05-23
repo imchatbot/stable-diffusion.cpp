@@ -181,13 +181,9 @@ struct Approximator_ggml : public UnaryBlock {
             blocks["layers." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new MLPEmbedder(hidden_dim, hidden_dim));
             blocks["norms." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new RMSNorm(hidden_dim));
         }
-        blocks["out_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_dim, out_dim));
+        blocks["out_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_dim , out_dim));
     }
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        // Rely on the base class to initialize nested blocks
-        UnaryBlock::init_params(ctx, tensor_types, prefix);
-    }
 
     struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* timestep) {
         // Implement forward pass based on the pseudo-code in the plan (Phase 2.2)
@@ -243,10 +239,6 @@ struct QKNorm : public GGMLBlock {
         return norm->forward(ctx, x);
     }
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        // Rely on the base class to initialize nested blocks
-        GGMLBlock::init_params(ctx, tensor_types, prefix);
-    }
 };
 
 // Based on the plan (Phase 1.2 and 2.5)
@@ -262,12 +254,6 @@ struct SelfAttention : public GGMLBlock {
         blocks["norm"] = std::shared_ptr<GGMLBlock>(new QKNorm(head_dim));
         blocks["proj"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim));
     }
-
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        // Rely on the base class to initialize nested blocks
-        GGMLBlock::init_params(ctx, tensor_types, prefix);
-    }
-
     std::vector<struct ggml_tensor*> pre_attention(struct ggml_context* ctx, struct ggml_tensor* x) {
         auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv"]);
         auto norm = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
@@ -288,7 +274,7 @@ struct SelfAttention : public GGMLBlock {
         auto v = ggml_view_3d(ctx, qkv_split, dim, L, N, qkv_split->nb[1], qkv_split->nb[2], offset * 2); // [dim, L, N]
 
         // Reshape q, k, v for QKNorm and ggml_nn_attention_ext
-        // QKNorm expects [..., dim], ggml_nn_attention_ext expects [d_head, L, N*n_head] for q, k and [d_head, L, n_head, N] for v
+        // QKNorm expects [..., dim], ggml_nn_attention_ext expects [d_head, L, N*n_head] or similar depending on implementation
         // Let's reshape q, k, v to [d_head, L, N*n_head] and [d_head, L, n_head, N] respectively
 
         auto q_reshaped = ggml_reshape_3d(ctx, q, head_dim, L, N * num_heads); // [dim, L, N] -> [d_head, L, N*n_head]
@@ -470,10 +456,6 @@ struct SingleStreamBlock_ggml : public GGMLBlock {
         // Modulation block is created and called in the forward pass based on the plan
     }
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        GGMLBlock::init_params(ctx, tensor_types, prefix);
-    }
-
     struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x, struct ggml_tensor* pe, struct ModulationOut& mod, struct ggml_tensor* attn_mask = NULL) {
         // x: [N, L, hidden_size]
         // pe: Positional embeddings (shape TBD)
@@ -573,10 +555,6 @@ struct DoubleStreamBlock_ggml : public GGMLBlock { // DoubleStreamBlock forward 
         blocks["txt_mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(mlp_hidden_dim, hidden_size));
     }
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        GGMLBlock::init_params(ctx, tensor_types, prefix);
-    }
-
     std::pair<struct ggml_tensor*, struct ggml_tensor*> forward(struct ggml_context* ctx, struct ggml_tensor* img, struct ggml_tensor* txt, struct ggml_tensor* pe, const std::vector<ModulationOut>& img_mods, const std::vector<ModulationOut>& txt_mods, struct ggml_tensor* attn_mask = NULL) {
         auto img_norm1 = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"]);
         auto img_attn  = std::dynamic_pointer_cast<SelfAttention>(blocks["img_attn"]);
@@ -665,9 +643,6 @@ struct LastLayer_ggml : public GGMLBlock {
     }
 
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        GGMLBlock::init_params(ctx, tensor_types, prefix);
-    }
 
     struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x, struct ggml_tensor* shift, struct ggml_tensor* scale) {
         auto norm_final = std::dynamic_pointer_cast<LayerNorm>(blocks["norm_final"]);
@@ -718,7 +693,7 @@ struct ChromaUNet_ggml : public GGMLBlock {
         : hidden_size(hidden_size), num_heads(num_heads), mlp_ratio(mlp_ratio),
           depth(depth), single_depth(single_depth), in_channels(in_channels),
           out_channels(out_channels), flash_attn(flash_attn) {
-        blocks["approximator"] = std::shared_ptr<GGMLBlock>(new Approximator_ggml(1, hidden_size * 6, hidden_size)); // out_dim is hidden_size * 6 for 2 sets of scale/shift/gate
+        blocks["distilled_guidance_layer"] = std::shared_ptr<GGMLBlock>(new Approximator_ggml(64, hidden_size * 6 , hidden_size)); // out_dim is hidden_size * 6 for 2 sets of scale/shift/gate
 
         blocks["img_in"] = std::shared_ptr<GGMLBlock>(new Linear(in_channels, hidden_size, true));
         blocks["txt_in"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size, true)); // T5 embeddings are already hidden_size
@@ -734,9 +709,6 @@ struct ChromaUNet_ggml : public GGMLBlock {
         blocks["final_layer"] = std::shared_ptr<GGMLBlock>(new LastLayer_ggml(hidden_size, 1, out_channels)); // patch_size is 1 for Chroma
     }
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
-        GGMLBlock::init_params(ctx, tensor_types, prefix);
-    }
 
     struct ggml_tensor* forward(struct ggml_context* ctx,
                                 struct ggml_tensor* img_latent,
@@ -745,7 +717,7 @@ struct ChromaUNet_ggml : public GGMLBlock {
                                 struct ggml_tensor* pe,
                                 struct ggml_tensor* t5_padding_mask,
                                 std::vector<int> skip_layers = std::vector<int>()) {
-        auto approximator = std::dynamic_pointer_cast<Approximator_ggml>(blocks["approximator"]);
+        auto approximator = std::dynamic_pointer_cast<Approximator_ggml>(blocks["distilled_guidance_layer"]);
         auto img_in       = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
         auto txt_in       = std::dynamic_pointer_cast<Linear>(blocks["txt_in"]);
         auto final_layer  = std::dynamic_pointer_cast<LastLayer_ggml>(blocks["final_layer"]);
@@ -804,10 +776,6 @@ struct ChromaUNet_ggml : public GGMLBlock {
             // This means approx_output needs to be split into one set of (scale, shift, gate).
             // This is inconsistent with the DoubleStreamBlock.
 
-            // Let's assume the `vec` for SingleStreamBlock is also from the Approximator.
-            // And we need a separate Modulation instance for it.
-            // This means the Approximator output needs to be even larger.
-
             // Re-reading the plan:
             // Approximator output: `conditioning signal (Tensor of shape [batch_size, 1, out_dim])`, likely split into scale, shift, gate.
             // SingleStreamBlock: `mod = vec`
@@ -816,19 +784,6 @@ struct ChromaUNet_ggml : public GGMLBlock {
             // This implies `vec` is a complex structure.
             // Let's assume `approx_output` is the `vec` and it contains all necessary modulation parameters.
             // And the `Modulation` class will be used to extract them.
-
-            // Let's create a single Modulation instance for SingleStreamBlock.
-            // And pass the relevant part of approx_output to it.
-            // This means approx_output needs to be split into one set of (scale, shift, gate).
-
-            // This is getting complicated. Let's simplify.
-            // The `FluxModel` passes a single `vec` to all blocks.
-            // Let's assume `approx_output` is the single `vec` for all blocks.
-            // And each block will extract what it needs.
-
-            // For SingleStreamBlock, it needs one ModulationOut.
-            // So, we need to extract one ModulationOut from `approx_output`.
-            // This means `approx_output` should contain at least `hidden_size * 3`.
 
             // Let's assume `approx_output` is `hidden_size * 6` (for 2 sets of modulations).
             // And `SingleStreamBlock` will use the first set.
@@ -909,7 +864,8 @@ struct ChromaRunner : public GGMLRunner {
     ChromaRunner(
         ggml_backend_t backend,
         std::map<std::string, enum ggml_type>& tensor_types,
-        bool flash_attn 
+        const std::string prefix                            = "",
+        bool flash_attn = false
     ) :
         GGMLRunner(backend),
         chroma_params({
@@ -921,7 +877,7 @@ struct ChromaRunner : public GGMLRunner {
             chroma_params.in_channels, chroma_params.out_channels, chroma_params.flash_attn
         )
     {
-        chroma_unet.init_params(params_ctx, tensor_types);
+        chroma_unet.init(params_ctx, tensor_types,prefix);
     }
 
     std::string get_desc() override {

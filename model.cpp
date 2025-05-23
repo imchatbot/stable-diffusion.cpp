@@ -940,8 +940,6 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
         struct ggml_tensor* dummy = ggml_get_tensor(ctx_meta_, name.c_str());
         size_t offset             = data_offset + gguf_get_tensor_offset(ctx_gguf_, i);
 
-        LOG_INFO("GGUF Tensor: %s, type: %s", name.c_str(), ggml_type_name(dummy->type)); // Added debug log
-
         // LOG_DEBUG("%s", name.c_str());
 
         TensorStorage tensor_storage(prefix + name, dummy->type, dummy->ne, ggml_n_dims(dummy), file_index, offset);
@@ -1492,7 +1490,7 @@ SDVersion ModelLoader::get_sd_version() {
 #define found_family (is_xl || is_flux)
     for (auto& tensor_storage : tensor_storages) {
         if (!found_family) {
-            if (tensor_storage.name.find("distilled_guidance_layer.in_proj.bias") != std::string::npos) {
+            if (tensor_storage.name.find("model.diffusion_model.distilled_guidance_layer.in_proj.bias") != std::string::npos) {
                 return VERSION_CHROMA;
             }
             if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos) {
