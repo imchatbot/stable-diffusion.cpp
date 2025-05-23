@@ -458,7 +458,7 @@ public:
                        bool use_video_decoder = false,
                        SDVersion version      = VERSION_SD1)
         : decode_only(decode_only), use_video_decoder(use_video_decoder) {
-        if (sd_version_is_dit(version)) {
+        if (sd_version_is_dit(version) || sd_version_is_chroma(version)) {
             dd_config.z_channels = 16;
             use_quant            = false;
         }

@@ -1218,4 +1218,117 @@ struct FluxCLIPEmbedder : public Conditioner {
     }
 };
 
+struct ChromaT5Embedder : public Conditioner {
+    T5UniGramTokenizer t5_tokenizer;
+    std::shared_ptr<T5Runner> t5;
+
+    ChromaT5Embedder(ggml_backend_t backend,
+                    std::map<std::string, enum ggml_type>& tensor_types)
+    { // Initialize prefix_
+        t5 = std::make_shared<T5Runner>(backend, tensor_types, "text_encoders.t5xxl.transformer");
+    }
+
+    SDCondition get_learned_condition(ggml_context* work_ctx,
+                                      int n_threads,
+                                      const std::string& text,
+                                      int clip_skip, // Not used by T5
+                                      int width,     // Not used by T5
+                                      int height,    // Not used by T5
+                                      int adm_in_channels        = -1, // Not used by T5
+                                      bool force_zero_embeddings = false) override {
+        // Tokenize the text using T5UniGramTokenizer
+        auto parsed_attention = parse_prompt_attention(text);
+        std::vector<int> tokens;
+        std::vector<float> weights;
+
+        for (const auto& item : parsed_attention) {
+            const std::string& curr_text = item.first;
+            float curr_weight            = item.second;
+            std::vector<int> curr_tokens = t5_tokenizer.Encode(curr_text, false);
+            tokens.insert(tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            weights.insert(weights.end(), curr_tokens.size(), curr_weight);
+        }
+
+        // Add EOS token and pad
+        int EOS_TOKEN_ID = 1; // Assuming EOS_TOKEN_ID for T5 is 1
+        tokens.push_back(EOS_TOKEN_ID);
+        weights.push_back(1.0);
+        t5_tokenizer.pad_tokens(tokens, weights, 256, true); // Max length 256 for T5, enable padding
+
+        // Create input_ids tensor from tokens
+        struct ggml_tensor* input_ids = vector_to_ggml_tensor_i32(work_ctx, tokens);
+        struct ggml_tensor* hidden_states = NULL;
+
+        // Compute T5 embeddings
+        t5->compute(n_threads, input_ids, &hidden_states, work_ctx);
+
+        // Apply weights to hidden_states, similar to FluxCLIPEmbedder
+        if (!force_zero_embeddings) {
+            auto tensor = hidden_states;
+            float original_mean = ggml_tensor_mean(tensor);
+            // T5 output is [N, n_token, model_dim], so ne[0] is model_dim, ne[1] is n_token
+            for (int i1 = 0; i1 < tensor->ne[1]; i1++) { // Iterate over tokens
+                for (int i0 = 0; i0 < tensor->ne[0]; i0++) { // Iterate over hidden_size
+                    float value = ggml_tensor_get_f32(tensor, i0, i1, 0); // Assuming 2D tensor
+                    value *= weights[i1]; // Apply weight for this token
+                    ggml_tensor_set_f32(tensor, value, i0, i1, 0);
+                }
+            }
+            float new_mean = ggml_tensor_mean(tensor);
+            ggml_tensor_scale(tensor, (original_mean / new_mean));
+        } else {
+            float* vec = (float*)hidden_states->data;
+            for (int i = 0; i < ggml_nelements(hidden_states); i++) {
+                vec[i] = 0;
+            }
+        }
+
+        // Generate T5 padding mask (c_concat)
+        struct ggml_tensor* c_concat_tensor = NULL;
+        std::vector<float> padding_mask_vec(tokens.size());
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            padding_mask_vec[i] = (tokens[i] == t5_tokenizer.pad_id_) ? 0.0f : 1.0f;
+        }
+        c_concat_tensor = vector_to_ggml_tensor(work_ctx, padding_mask_vec);
+        c_concat_tensor = ggml_reshape_2d(work_ctx, c_concat_tensor, 1, tokens.size()); // Reshape to [1, N_tokens]
+
+        return SDCondition(hidden_states, NULL, c_concat_tensor);
+    }
+
+    void alloc_params_buffer()  {
+        t5->alloc_params_buffer();
+    }
+
+    void free_params_buffer()  {
+        t5->free_params_buffer();
+    }
+
+    void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors) {
+        t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
+    }
+
+    size_t get_params_buffer_size() {
+        return t5->get_params_buffer_size();
+    }
+
+    std::tuple<SDCondition, std::vector<bool>> get_learned_condition_with_trigger(ggml_context* work_ctx,
+                                                                                  int n_threads,
+                                                                                  const std::string& text,
+                                                                                  int clip_skip,
+                                                                                  int width,
+                                                                                  int height,
+                                                                                  int num_input_imgs,
+                                                                                  int adm_in_channels        = -1,
+                                                                                  bool force_zero_embeddings = false) override {
+        GGML_ASSERT(0 && "Not implemented yet!");
+        return std::make_tuple(SDCondition(), std::vector<bool>());
+    }
+
+    std::string remove_trigger_from_prompt(ggml_context* work_ctx,
+                                           const std::string& prompt) override {
+        GGML_ASSERT(0 && "Not implemented yet!");
+        return "";
+    }
+};
+
 #endif

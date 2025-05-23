@@ -82,6 +82,7 @@ protected:
     int unk_id_            = 2;
     std::string eos_token_ = "</s>";
     int eos_id_            = 1;
+    public: // Make pad_id_ public
     int pad_id_            = 0;
     // status.
     Status status_ = OK;
@@ -441,7 +442,8 @@ protected:
     int64_t hidden_size;
     float eps;
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") {
+
+    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
         enum ggml_type wtype = GGML_TYPE_F32;  //(tensor_types.find(prefix + "weight") != tensor_types.end()) ? tensor_types[prefix + "weight"] : GGML_TYPE_F32;
         params["weight"]     = ggml_new_tensor_1d(ctx, wtype, hidden_size);
     }
@@ -452,7 +454,7 @@ public:
         : hidden_size(hidden_size),
           eps(eps) {}
 
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) {
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) override {
         struct ggml_tensor* w = params["weight"];
         x                     = ggml_rms_norm(ctx, x, eps);
         x                     = ggml_mul(ctx, x, w);
