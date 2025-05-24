@@ -279,7 +279,7 @@ protected:
             bool has_single_node = false;
             const int mblen =
                 std::min<int>(OneCharLen(normalized.data() + starts_at),
-                              size - starts_at);
+                                size - starts_at);
             while (key_pos < size) {
                 const int ret =
                     trie_->traverse(normalized.data(), node_pos, key_pos, key_pos + 1);
@@ -675,32 +675,41 @@ public:
         struct ggml_tensor* internal_attn_mask = NULL; // Default to NULL
 
         if (attention_mask_01 != NULL) { // Only process if a mask is provided
-            int64_t N_batch = x->ne[2]; // Assuming x is [model_dim, seq_len, N_batch] or [seq_len, model_dim, N_batch] and permuted to N,L,D
-            int64_t seq_len = x->ne[1]; // After x is permuted to [N, L, D]
+            int64_t N_batch = x->ne[2]; // Assuming x is [N, seq_len, model_dim]
+            int64_t seq_len = x->ne[1];
 
             // Ensure attention_mask_01 is [N_batch, seq_len]
             struct ggml_tensor* current_mask_01 = attention_mask_01;
-            if (ggml_n_dims(attention_mask_01) == 1 && x->ne[2] == 1) { // Mask is [L], x is [N=1, L, D]
-                current_mask_01 = ggml_reshape_2d(ctx, attention_mask_01, attention_mask_01->ne[0], 1); // [L, N=1]
-                current_mask_01 = ggml_cont(ctx, ggml_permute(ctx, current_mask_01, 1, 0, 2, 3)); // [N=1, L]
-            } else if (ggml_n_dims(attention_mask_01) == 2 && attention_mask_01->ne[0] == x->ne[1] && attention_mask_01->ne[1] == x->ne[2]) { // Mask is [L, N], x is [N, L, D]
-                current_mask_01 = ggml_cont(ctx, ggml_permute(ctx, attention_mask_01, 1, 0, 2, 3)); // [N, L]
-            } else if (ggml_n_dims(attention_mask_01) == 2 && (attention_mask_01->ne[0] != x->ne[2] || attention_mask_01->ne[1] != x->ne[1])) { // Mask is [N,L] x is [N,L,D]
+
+            int64_t mask_ne0 = attention_mask_01->ne[0];
+            int64_t mask_ne1 = ggml_n_dims(attention_mask_01) > 1 ? attention_mask_01->ne[1] : 1;
+
+            if (ggml_n_dims(attention_mask_01) == 1 && N_batch == 1 && mask_ne0 == seq_len) { // Mask is [L], x is [N=1, L, D]
+                 current_mask_01 = ggml_reshape_2d(ctx, attention_mask_01, attention_mask_01->ne[0], 1); // [L, N=1]
+                 current_mask_01 = ggml_cont(ctx, ggml_permute(ctx, current_mask_01, 1, 0, 2, 3)); // [N=1, L]
+            } else if (ggml_n_dims(attention_mask_01) == 2 && mask_ne0 == N_batch && mask_ne1 == seq_len) { // Mask is [N, L], x is [N, L, D]
+                 // Already in correct shape [N, L]
+            } else if (ggml_n_dims(attention_mask_01) == 2 && mask_ne0 == seq_len && mask_ne1 == N_batch) { // Mask is [L, N], x is [N, L, D]
+                 current_mask_01 = ggml_cont(ctx, ggml_permute(ctx, attention_mask_01, 1, 0, 2, 3)); // Permute to [N, L]
+            } else {
                  // If shapes don't align for [N, L] after potential permute, log warning and proceed without mask
                  fprintf(stderr, "T5Stack: Warning - Mismatch between input x shape [%" PRId64 ", %" PRId64 ", %" PRId64 "] and attention_mask_01 shape [%" PRId64 ", %" PRId64 "]. Masking disabled.\n",
                          x->ne[2], x->ne[1], x->ne[0],
-                         ggml_n_dims(attention_mask_01) > 1 ? attention_mask_01->ne[1] : 1, attention_mask_01->ne[0]);
+                         mask_ne0, mask_ne1);
                  current_mask_01 = NULL; // Disable masking if shapes are problematic
             }
 
 
-            if (current_mask_01) { // Proceed if mask is valid
+            if (current_mask_01) { // Proceed if mask is valid and in [N, L] shape
                 struct ggml_tensor* ones = ggml_new_tensor(ctx, current_mask_01->type, ggml_n_dims(current_mask_01), current_mask_01->ne); // [N, seq_len]
                 ggml_set_f32(ones, 1.0f);
                 struct ggml_tensor* inverted_mask = ggml_sub(ctx, ones, current_mask_01); // [N, seq_len], 1 for pad, 0 for valid
 
-                internal_attn_mask = ggml_reshape_4d(ctx, inverted_mask, 1, seq_len, 1, N_batch); // [N, 1, seq_len, 1] (ne0=1, ne1=L, ne2=1, ne3=N)
-                internal_attn_mask = ggml_cont(ctx, ggml_permute(ctx, internal_attn_mask, 0,2,3,1)); // [N, 1, 1, seq_len] (ne0=1, ne1=1, ne2=L, ne3=N)
+                // Reshape for broadcasting to attention scores: [N, 1, 1, seq_len_k]
+                // Assuming attention scores are [N, n_head, seq_len_q, seq_len_k]
+                // The inverted_mask is [N, seq_len]. We need [N, 1, 1, seq_len]
+                internal_attn_mask = ggml_reshape_4d(ctx, inverted_mask, inverted_mask->ne[0], 1, 1, inverted_mask->ne[1]); // [N, 1, 1, L]
+                // internal_attn_mask = ggml_cont(ctx, ggml_permute(ctx, internal_attn_mask, 0,2,3,1)); // [N, 1, 1, seq_len] (ne0=1, ne1=1, ne2=L, ne3=N) - This permute seems wrong based on target shape [N,1,1,L]
 
                 struct ggml_tensor* neg_inf_scalar = ggml_new_f32(ctx, -1e9f);
                 internal_attn_mask = ggml_mul(ctx, internal_attn_mask, neg_inf_scalar);
@@ -724,11 +733,14 @@ public:
 // T5::forward: Modified to handle NULL attention_mask_01
 struct T5 : public GGMLBlock {
 public:
+    int64_t model_dim; // Add model_dim as a member
+
     T5(int64_t num_layers,
        int64_t model_dim,
        int64_t ff_dim,
        int64_t num_heads,
-       int64_t vocab_size) {
+       int64_t vocab_size) : model_dim(model_dim) // Initialize model_dim
+    {
         blocks["encoder"] = std::shared_ptr<GGMLBlock>(new T5Stack(num_layers, model_dim, model_dim, ff_dim, num_heads));
         blocks["shared"]  = std::shared_ptr<GGMLBlock>(new Embedding(vocab_size, model_dim));
     }
@@ -745,10 +757,22 @@ public:
 
         // Tentative permute for x: from [D, L, N] to [N, L, D] if input_ids was [L,N]
         // This needs to be robust. A common way is to check if last dim of x matches N from input_ids.
-        if (input_ids->ne[1] == x->ne[2] && input_ids->ne[0] == x->ne[1] && x->ne[0] != x->ne[2]) { // If x is [D,L,N] and input_ids is [L,N]
-            x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 1, 0, 3)); // D,L,N -> N,L,D
-        } else if (input_ids->ne[0] == x->ne[2] && input_ids->ne[1] == x->ne[1] && x->ne[0] != x->ne[2]) { // If x is [D,N,L] and input_ids is [N,L] -> permute?
-             // This case is less likely given standard embedding output.
+        // Assuming Embedding output is [D, L, N] if input_ids is [L, N] or [D, N, L] if input_ids is [N, L]
+        // We need [N, L, D] for T5Stack forward.
+        if (ggml_n_dims(x) == 3) {
+             int64_t x_d = x->ne[0];
+             int64_t x_l = x->ne[1];
+             int64_t x_n = x->ne[2];
+
+             int64_t input_ids_l = input_ids->ne[0];
+             int64_t input_ids_n = ggml_n_dims(input_ids) > 1 ? input_ids->ne[1] : 1;
+
+             if (x_d != model_dim && x_l == input_ids_l && x_n == input_ids_n) { // Likely [D, L, N] -> permute to [N, L, D]
+                 x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 1, 0, 3));
+             } else if (x_d != model_dim && x_l == input_ids_n && x_n == input_ids_l) { // Likely [D, N, L] -> permute to [N, L, D]
+                 x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+             }
+             // If x is already [N, L, D], no permute needed.
         }
 
 
