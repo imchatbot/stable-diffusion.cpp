@@ -650,6 +650,7 @@ public:
     }
 };
 
+// T5Stack::forward: Modified to handle NULL attention_mask_01
 struct T5Stack : public GGMLBlock {
     int64_t num_layers;
 
@@ -663,31 +664,64 @@ public:
         for (int i = 0; i < num_layers; i++) {
             blocks["block." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new T5Block(model_dim, inner_dim, ff_dim, num_heads, i == 0));
         }
-
         blocks["final_layer_norm"] = std::shared_ptr<GGMLBlock>(new T5LayerNorm(model_dim));
     }
 
     struct ggml_tensor* forward(struct ggml_context* ctx,
-                                struct ggml_tensor* x,
+                                struct ggml_tensor* x,                        // Input embeddings: [N, n_token, model_dim]
                                 struct ggml_tensor* past_bias                = NULL,
-                                struct ggml_tensor* attention_mask           = NULL,
+                                struct ggml_tensor* attention_mask_01        = NULL, // Input 0/1 mask: [N, n_token] (0 for pad, 1 for valid) or NULL
                                 struct ggml_tensor* relative_position_bucket = NULL) {
-        // x: [N, n_token, model_dim]
+        struct ggml_tensor* internal_attn_mask = NULL; // Default to NULL
+
+        if (attention_mask_01 != NULL) { // Only process if a mask is provided
+            int64_t N_batch = x->ne[2]; // Assuming x is [model_dim, seq_len, N_batch] or [seq_len, model_dim, N_batch] and permuted to N,L,D
+            int64_t seq_len = x->ne[1]; // After x is permuted to [N, L, D]
+
+            // Ensure attention_mask_01 is [N_batch, seq_len]
+            struct ggml_tensor* current_mask_01 = attention_mask_01;
+            if (ggml_n_dims(attention_mask_01) == 1 && x->ne[2] == 1) { // Mask is [L], x is [N=1, L, D]
+                current_mask_01 = ggml_reshape_2d(ctx, attention_mask_01, attention_mask_01->ne[0], 1); // [L, N=1]
+                current_mask_01 = ggml_cont(ctx, ggml_permute(ctx, current_mask_01, 1, 0, 2, 3)); // [N=1, L]
+            } else if (ggml_n_dims(attention_mask_01) == 2 && attention_mask_01->ne[0] == x->ne[1] && attention_mask_01->ne[1] == x->ne[2]) { // Mask is [L, N], x is [N, L, D]
+                current_mask_01 = ggml_cont(ctx, ggml_permute(ctx, attention_mask_01, 1, 0, 2, 3)); // [N, L]
+            } else if (ggml_n_dims(attention_mask_01) == 2 && (attention_mask_01->ne[0] != x->ne[2] || attention_mask_01->ne[1] != x->ne[1])) { // Mask is [N,L] x is [N,L,D]
+                 // If shapes don't align for [N, L] after potential permute, log warning and proceed without mask
+                 fprintf(stderr, "T5Stack: Warning - Mismatch between input x shape [%" PRId64 ", %" PRId64 ", %" PRId64 "] and attention_mask_01 shape [%" PRId64 ", %" PRId64 "]. Masking disabled.\n",
+                         x->ne[2], x->ne[1], x->ne[0],
+                         ggml_n_dims(attention_mask_01) > 1 ? attention_mask_01->ne[1] : 1, attention_mask_01->ne[0]);
+                 current_mask_01 = NULL; // Disable masking if shapes are problematic
+            }
+
+
+            if (current_mask_01) { // Proceed if mask is valid
+                struct ggml_tensor* ones = ggml_new_tensor(ctx, current_mask_01->type, ggml_n_dims(current_mask_01), current_mask_01->ne); // [N, seq_len]
+                ggml_set_f32(ones, 1.0f);
+                struct ggml_tensor* inverted_mask = ggml_sub(ctx, ones, current_mask_01); // [N, seq_len], 1 for pad, 0 for valid
+
+                internal_attn_mask = ggml_reshape_4d(ctx, inverted_mask, 1, seq_len, 1, N_batch); // [N, 1, seq_len, 1] (ne0=1, ne1=L, ne2=1, ne3=N)
+                internal_attn_mask = ggml_cont(ctx, ggml_permute(ctx, internal_attn_mask, 0,2,3,1)); // [N, 1, 1, seq_len] (ne0=1, ne1=1, ne2=L, ne3=N)
+
+                struct ggml_tensor* neg_inf_scalar = ggml_new_f32(ctx, -1e9f);
+                internal_attn_mask = ggml_mul(ctx, internal_attn_mask, neg_inf_scalar);
+            }
+        }
+        // If attention_mask_01 was NULL, internal_attn_mask remains NULL.
+
         for (int i = 0; i < num_layers; i++) {
             auto block = std::dynamic_pointer_cast<T5Block>(blocks["block." + std::to_string(i)]);
-
-            auto ret  = block->forward(ctx, x, past_bias, attention_mask, relative_position_bucket);
+            auto ret  = block->forward(ctx, x, past_bias, internal_attn_mask, relative_position_bucket); // Pass potentially NULL internal_attn_mask
             x         = ret.first;
             past_bias = ret.second;
         }
 
         auto final_layer_norm = std::dynamic_pointer_cast<T5LayerNorm>(blocks["final_layer_norm"]);
-
         x = final_layer_norm->forward(ctx, x);
         return x;
     }
 };
 
+// T5::forward: Modified to handle NULL attention_mask_01
 struct T5 : public GGMLBlock {
 public:
     T5(int64_t num_layers,
@@ -700,21 +734,30 @@ public:
     }
 
     struct ggml_tensor* forward(struct ggml_context* ctx,
-                                struct ggml_tensor* input_ids,
+                                struct ggml_tensor* input_ids,                // [N, n_token] or [n_token, N]
                                 struct ggml_tensor* past_bias                = NULL,
-                                struct ggml_tensor* attention_mask           = NULL,
+                                struct ggml_tensor* attention_mask_01        = NULL, // [N, n_token] or [n_token, N] (0 for pad, 1 for valid) or NULL
                                 struct ggml_tensor* relative_position_bucket = NULL) {
-        // input_ids: [N, n_token]
-
-        auto shared  = std::dynamic_pointer_cast<Embedding>(blocks["shared"]);
+        auto shared_emb = std::dynamic_pointer_cast<Embedding>(blocks["shared"]);
         auto encoder = std::dynamic_pointer_cast<T5Stack>(blocks["encoder"]);
 
-        auto x = shared->forward(ctx, input_ids);
-        x      = encoder->forward(ctx, x, past_bias, attention_mask, relative_position_bucket);
+        auto x = shared_emb->forward(ctx, input_ids);
+
+        // Tentative permute for x: from [D, L, N] to [N, L, D] if input_ids was [L,N]
+        // This needs to be robust. A common way is to check if last dim of x matches N from input_ids.
+        if (input_ids->ne[1] == x->ne[2] && input_ids->ne[0] == x->ne[1] && x->ne[0] != x->ne[2]) { // If x is [D,L,N] and input_ids is [L,N]
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 1, 0, 3)); // D,L,N -> N,L,D
+        } else if (input_ids->ne[0] == x->ne[2] && input_ids->ne[1] == x->ne[1] && x->ne[0] != x->ne[2]) { // If x is [D,N,L] and input_ids is [N,L] -> permute?
+             // This case is less likely given standard embedding output.
+        }
+
+
+        x = encoder->forward(ctx, x, past_bias, attention_mask_01, relative_position_bucket); // Pass potentially NULL attention_mask_01
         return x;
     }
 };
 
+// T5Runner::build_graph and compute: Make attention_mask_01 optional
 struct T5Runner : public GGMLRunner {
     T5 model;
     std::vector<int> relative_position_bucket_vec;
@@ -731,129 +774,111 @@ struct T5Runner : public GGMLRunner {
         model.init(params_ctx, tensor_types, prefix);
     }
 
-    std::string get_desc() {
-        return "t5";
-    }
-
     void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors, const std::string prefix) {
         model.get_param_tensors(tensors, prefix);
     }
-
-    struct ggml_tensor* forward(struct ggml_context* ctx,
-                                struct ggml_tensor* input_ids,
-                                struct ggml_tensor* relative_position_bucket) {
-        size_t N       = input_ids->ne[1];
-        size_t n_token = input_ids->ne[0];
-
-        auto hidden_states = model.forward(ctx, input_ids, NULL, NULL, relative_position_bucket);  // [N, n_token, model_dim]
-        return hidden_states;
+    std::string get_desc() override {
+        return "t5";
     }
 
-    struct ggml_cgraph* build_graph(struct ggml_tensor* input_ids) {
+    struct ggml_cgraph* build_graph(struct ggml_tensor* input_ids, /* [N, L] or [L,N] */
+                                    struct ggml_tensor* attention_mask_01 = NULL /* [N,L] or [L,N], 0/1 mask, optional */ ) {
         struct ggml_cgraph* gf = ggml_new_graph(compute_ctx);
 
         input_ids = to_backend(input_ids);
+        if (attention_mask_01) attention_mask_01 = to_backend(attention_mask_01); // Only move to backend if provided
 
-        relative_position_bucket_vec = compute_relative_position_bucket(input_ids->ne[0], input_ids->ne[0]);
+        int64_t L = (ggml_n_dims(input_ids) == 1) ? input_ids->ne[0] : input_ids->ne[0]; // Assuming L is first non-batch dim
+        if (ggml_n_dims(input_ids) == 2 && input_ids->ne[1] > 1 && input_ids->ne[0] < input_ids->ne[1] ){ // Heuristic for [N,L]
+            L = input_ids->ne[1];
+        }
 
-        // for (int i = 0; i < relative_position_bucket_vec.size(); i++) {
-        //     if (i % 77 == 0) {
-        //         printf("\n");
-        //     }
-        //     printf("%d ", relative_position_bucket_vec[i]);
-        // }
 
-        auto relative_position_bucket = ggml_new_tensor_2d(compute_ctx,
-                                                           GGML_TYPE_I32,
-                                                           input_ids->ne[0],
-                                                           input_ids->ne[0]);
+        relative_position_bucket_vec = compute_relative_position_bucket(L, L);
+        auto relative_position_bucket = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_I32, L, L);
         set_backend_tensor_data(relative_position_bucket, relative_position_bucket_vec.data());
+        relative_position_bucket = to_backend(relative_position_bucket);
 
-        struct ggml_tensor* hidden_states = forward(compute_ctx, input_ids, relative_position_bucket);
+        struct ggml_tensor* hidden_states = model.forward(compute_ctx, input_ids, NULL, attention_mask_01, relative_position_bucket);
 
         ggml_build_forward_expand(gf, hidden_states);
-
         return gf;
     }
 
     void compute(const int n_threads,
                  struct ggml_tensor* input_ids,
-                 ggml_tensor** output,
+                 struct ggml_tensor* attention_mask_01 = NULL, // Optional
+                 ggml_tensor** output = NULL,
                  ggml_context* output_ctx = NULL) {
-        auto get_graph = [&]() -> struct ggml_cgraph* {
-            return build_graph(input_ids);
+        auto get_graph_fn = [&]() -> struct ggml_cgraph* {
+            return build_graph(input_ids, attention_mask_01);
         };
-        GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
+        GGMLRunner::compute(get_graph_fn, n_threads, true, output, output_ctx);
     }
-
+    // ... (_relative_position_bucket, compute_relative_position_bucket definitions) ...
     static std::vector<int> _relative_position_bucket(const std::vector<int>& relative_position,
                                                       bool bidirectional = true,
                                                       int num_buckets    = 32,
-                                                      int max_distance   = 128) {
-        std::vector<int> relative_buckets(relative_position.size(), 0);
-        std::vector<int> abs_relative_position = relative_position;
-
-        if (bidirectional) {
-            num_buckets = num_buckets / 2;
-            for (size_t i = 0; i < relative_position.size(); ++i) {
-                if (relative_position[i] > 0) {
-                    relative_buckets[i] += num_buckets;
-                }
-                abs_relative_position[i] = std::abs(relative_position[i]);
-            }
-        } else {
-            for (size_t i = 0; i < relative_position.size(); ++i) {
-                abs_relative_position[i] = std::max(-relative_position[i], 0);
-            }
-        }
-
-        int max_exact = num_buckets / 2;
-        std::vector<int> relative_position_if_large(relative_position.size(), 0);
-
-        for (size_t i = 0; i < relative_position.size(); ++i) {
-            if (abs_relative_position[i] < max_exact) {
-                relative_buckets[i] += abs_relative_position[i];
-            } else {
-                float log_pos                 = std::log(static_cast<float>(abs_relative_position[i]) / max_exact);
-                float log_base                = std::log(static_cast<float>(max_distance) / max_exact);
-                relative_position_if_large[i] = max_exact + static_cast<int>((log_pos / log_base) * (num_buckets - max_exact));
-                relative_position_if_large[i] = std::min(relative_position_if_large[i], num_buckets - 1);
-                relative_buckets[i] += relative_position_if_large[i];
-            }
-        }
-
-        return relative_buckets;
-    }
-
-    std::vector<int> compute_relative_position_bucket(int query_length,
-                                                      int key_length) {
-        std::vector<int> context_position(query_length);
-        std::vector<int> memory_position(key_length);
-
-        for (int i = 0; i < query_length; ++i) {
-            context_position[i] = i;
-        }
-        for (int i = 0; i < key_length; ++i) {
-            memory_position[i] = i;
-        }
-
-        std::vector<std::vector<int>> relative_position(query_length, std::vector<int>(key_length, 0));
-        for (int i = 0; i < query_length; ++i) {
-            for (int j = 0; j < key_length; ++j) {
-                relative_position[i][j] = memory_position[j] - context_position[i];
-            }
-        }
-
-        std::vector<int> relative_position_bucket;
-        for (int i = 0; i < query_length; ++i) {
-            std::vector<int> result = _relative_position_bucket(relative_position[i], true);
-            relative_position_bucket.insert(relative_position_bucket.end(), result.begin(), result.end());
-        }
-
-        return relative_position_bucket;
-    }
+                                                      int max_distance   = 128);
+    std::vector<int> compute_relative_position_bucket(int query_length, int key_length);
 };
 
+std::vector<int> T5Runner::_relative_position_bucket(const std::vector<int>& relative_position,
+                                                  bool bidirectional, int num_buckets, int max_distance) {
+    std::vector<int> relative_buckets(relative_position.size(), 0);
+    std::vector<int> abs_relative_position = relative_position;
+
+    if (bidirectional) {
+        num_buckets /= 2;
+        for (size_t i = 0; i < relative_position.size(); ++i) {
+            if (relative_position[i] > 0) {
+                relative_buckets[i] += num_buckets;
+            }
+            abs_relative_position[i] = std::abs(relative_position[i]);
+        }
+    } else {
+        for (size_t i = 0; i < relative_position.size(); ++i) {
+            abs_relative_position[i] = std::max(-relative_position[i], 0);
+        }
+    }
+
+    int max_exact = num_buckets / 2;
+    for (size_t i = 0; i < relative_position.size(); ++i) {
+        if (abs_relative_position[i] < max_exact) {
+            relative_buckets[i] += abs_relative_position[i];
+        } else {
+            int rp_if_large = max_exact + static_cast<int>(
+                (std::log(static_cast<float>(abs_relative_position[i]) / max_exact) /
+                 std::log(static_cast<float>(max_distance) / max_exact)) *
+                (num_buckets - max_exact));
+            relative_buckets[i] += std::min(rp_if_large, num_buckets - 1);
+        }
+    }
+    return relative_buckets;
+}
+
+std::vector<int> T5Runner::compute_relative_position_bucket(int query_length, int key_length) {
+    std::vector<int> context_position(query_length);
+    std::vector<int> memory_position(key_length);
+    for (int i = 0; i < query_length; ++i) context_position[i] = i;
+    for (int i = 0; i < key_length; ++i) memory_position[i] = i;
+
+    std::vector<int> relative_position_flat;
+    relative_position_flat.reserve(query_length * key_length);
+    for (int i = 0; i < query_length; ++i) {
+        std::vector<int> rp_row(key_length);
+        for (int j = 0; j < key_length; ++j) {
+            rp_row[j] = memory_position[j] - context_position[i];
+        }
+        std::vector<int> bucket_row = _relative_position_bucket(rp_row, true, 32, 128); // Default T5 values
+        relative_position_flat.insert(relative_position_flat.end(), bucket_row.begin(), bucket_row.end());
+    }
+    return relative_position_flat;
+}
+
+
+// T5Embedder::compute calls t5->compute, which now accepts the optional mask.
+// It should be fine.
 struct T5Embedder {
     T5UniGramTokenizer tokenizer;
     T5Runner model;
@@ -946,7 +971,7 @@ struct T5Embedder {
             struct ggml_tensor* out = NULL;
 
             int t0 = ggml_time_ms();
-            model.compute(8, input_ids, &out, work_ctx);
+            model.compute(8, input_ids, NULL, &out, work_ctx); // Corrected call
             int t1 = ggml_time_ms();
 
             print_ggml_tensor(out);

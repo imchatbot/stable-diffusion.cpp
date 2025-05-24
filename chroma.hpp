@@ -7,145 +7,140 @@
 #include <string>
 #include <map>
 #include <memory>
-#include <cmath> // For std::sqrt, std::exp, std::log, std::min, std::max
-#include <algorithm> // For std::min, std::max
+#include <cmath>     // For std::sqrt, std::exp, std::log, std::min, std::max
+#include <algorithm> // For std::min, std::max, std::find
+#include <utility>   // For std::pair
 
-#include "ggml_extend.hpp"
-#include "model.h"
+#include "ggml_extend.hpp" // Assuming this contains Linear, LayerNorm, UnaryBlock, GGMLBlock etc.
+#include "model.h"         // For base classes like UnaryBlock, GGMLBlock
 
-namespace Chroma { // Added comment to force recompile
+namespace Chroma {
+
+struct ChromaParams {
+    // From your GGUF and Python code
+    int32_t in_channels = 64;
+    int32_t out_channels = 64;
+    int32_t t5_embed_dim = 4096; // context_in_dim in Python
+
+    // Approximator specific (distilled_guidance_layer)
+    // in_dim for Approximator is determined by concatenation of timestep_guidance and modulation_index embeddings.
+    // E.g., (16*2 + 16*2 for ts/guidance + 32 for index) = 64 + 32 = 96. (Python: input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1))
+    // Let's call this `approximator_input_concat_dim`. This must be correctly calculated.
+    // For now, let's assume a value, needs to be exact from Python logic.
+    int32_t approximator_input_concat_dim = 64; // Based on user clarification (16+16+32)
+    int32_t approximator_internal_hidden_dim = 5120; // hidden_dim for Approximator
+    int32_t approximator_feature_dim = 3072;       // out_dim for Approximator, this IS hidden_size of UNet
+
+    int32_t unet_model_dim = 3072; // hidden_size in Python UNet blocks
+    // ... other params like num_heads, mlp_ratio, depth etc. ...
+    int32_t num_heads = 24;
+    float mlp_ratio = 4.0f;
+    int32_t depth = 19;
+    int32_t depth_single_blocks = 38;
+
+    // For get_modulations logic
+    int32_t mod_vector_total_indices = 344; // from python mod_index_length
+
+    int32_t head_dim; // Will be unet_model_dim / num_heads
+    bool flash_attn = false;
+
+
+    ChromaParams() { // Default constructor to calculate derived values
+        if (num_heads > 0 && unet_model_dim > 0 && unet_model_dim % num_heads == 0) {
+            head_dim = unet_model_dim / num_heads;
+        } else {
+            head_dim = 128; // A sensible default if not calculable, but should be derived
+        }
+    }
+};
 
 __STATIC_INLINE__ struct ggml_tensor* attention(struct ggml_context* ctx,
-                                                struct ggml_tensor* q,
-                                                struct ggml_tensor* k,
-                                                struct ggml_tensor* v,
-                                                struct ggml_tensor* pe,
+                                                struct ggml_tensor* q, // Expected: [d_head, L_q, N*n_head]
+                                                struct ggml_tensor* k, // Expected: [d_head, L_k, N*n_head]
+                                                struct ggml_tensor* v, // Expected: [d_head, L_v, N*n_head] (L_v == L_k)
+                                                struct ggml_tensor* pe, // Positional embeddings, may not be directly used by ggml_flash_attn_ext
+                                                int64_t num_heads,      // Added num_heads to derive original N
                                                 struct ggml_tensor* attn_mask = NULL) {
-    // q,k,v: [N, L, n_head, d_head]
-    // pe: [L, d_head/2, 2, 2]
-    // return: [N, L, n_head*d_head]
+    // q, k, v are typically [d_head, L, N*n_head] for flash_attn
+    // pe: [L, d_head/2, 2, 2] (RoPE applied before this call if needed by flash_attn_ext version)
+    // return: [N, L_q, n_head*d_head]
 
-    // Apply RoPE (Rotary Positional Embeddings) - Adaptation from Flux
-    // Note: Chroma's RoPE might differ slightly, this is based on Flux's implementation for now.
-    // Need to verify Chroma's specific RoPE application if different.
-    // Assuming pe is already in the correct format [L, d_head/2, 2, 2] or similar for broadcasting
-
-    // Reshape q, k, v for RoPE application if needed (Flux's apply_rope expects [N, L, n_head, d_head])
-    // Assuming q, k, v are already in the expected shape [N, L, n_head, d_head] based on SelfAttention pre_attention output
-
-    // Apply RoPE to q and k
-    // Note: The exact implementation of apply_rope is not in ggml_extend.hpp or provided.
-    // We will use a placeholder or assume a compatible ggml operation exists or will be added.
-    // For now, let's assume a function `ggml_apply_rope` exists that takes q, k, and pe.
-    // If not, we'll need to implement the RoPE logic using basic ggml operations.
-
-    // Placeholder for RoPE application - assuming ggml_apply_rope exists or similar logic is used
-    // struct ggml_tensor* q_rope = ggml_apply_rope(ctx, q, pe);
-    // struct ggml_tensor* k_rope = ggml_apply_rope(ctx, k, pe);
-
-    // For now, let's proceed without explicit RoPE application in this placeholder,
-    // as the plan's pseudo-code for SelfAttention forward doesn't explicitly show RoPE calls,
-    // but the DoubleStreamBlock pseudo-code does. This suggests RoPE might be handled differently
-    // or within the attention function itself in Chroma.
-    // Let's use the ggml_flash_attn_ext directly with the provided q, k, v, pe, and mask.
-
-    // Compute attention using ggml_flash_attn_ext
-    // ggml_flash_attn_ext expects q, k, v in shape [N*n_head, L, d_head] or similar depending on implementation
-    // The plan's pseudo-code for SingleStreamBlock shows q, k, v reshaped to [batch_size, num_heads, sequence_length, head_dim]
-    // and then permuted before attention. Let's follow that pattern for the inputs to ggml_flash_attn_ext.
-
-    int64_t N = q->ne[3]; // Batch size
-    int64_t L_q = q->ne[2]; // Sequence length Q
-    int64_t L_k = k->ne[2]; // Sequence length K
-    int64_t n_head = q->ne[1]; // Number of heads
-    int64_t d_head = q->ne[0]; // Head dimension
-
-    // Reshape and permute q, k, v for ggml_flash_attn_ext if necessary
-    // Assuming the inputs q, k, v to this function are already in the required format for ggml_flash_attn_ext
-    // based on the SelfAttention pre_attention output.
-    // If pre_attention outputs [N, L, n_head, d_head], we need to reshape/permute here.
-    // Let's assume pre_attention outputs [N*n_head, L, d_head] for now, consistent with ggml_nn_attention_ext usage in flux.hpp.
+    int64_t d_head = q->ne[0];
+    int64_t L_q = q->ne[1];
+    // N_x_n_head = q->ne[2]
+    int64_t N = q->ne[2] / num_heads; // Derive N
 
     float scale = 1.0f / std::sqrt((float)d_head);
 
-    struct ggml_tensor* attn_output = ggml_flash_attn_ext(ctx, q, k, v, attn_mask, scale, 0, 0);
+    // ggml_flash_attn_ext expects q,k,v as [N_merged, L, D_head_actual] where N_merged can be B*H
+    // The output of ggml_flash_attn_ext is [N_merged, L_q, D_head_actual]
+    struct ggml_tensor* attn_output = ggml_flash_attn_ext(ctx, q, k, v, attn_mask, scale, 0, 0); // Assuming RoPE handled if flash_attn_ext needs it
 
-    // Reshape the output back to [N, L, n_head*d_head]
-    // Assuming attn_output is [N*n_head, L, d_head]
-    attn_output = ggml_reshape_4d(ctx, attn_output, d_head, L_q, n_head, N); // [N, n_head, L, d_head]
-    attn_output = ggml_permute(ctx, attn_output, 0, 2, 1, 3); // [N, L, n_head, d_head]
-    attn_output = ggml_cont(ctx, attn_output);
-    attn_output = ggml_reshape_3d(ctx, attn_output, d_head * n_head, L_q, N); // [N, L, n_head*d_head]
-
+    // Reshape the output from [N*n_head, L_q, d_head] to [N, L_q, n_head*d_head]
+    attn_output = ggml_reshape_4d(ctx, attn_output, d_head, L_q, num_heads, N); // [N, num_heads, L_q, d_head] (interpret N*num_heads as N, num_heads)
+    attn_output = ggml_cont(ctx, ggml_permute(ctx, attn_output, 0, 2, 1, 3));   // [N, L_q, num_heads, d_head]
+    attn_output = ggml_reshape_3d(ctx, attn_output, d_head * num_heads, L_q, N); // [N, L_q, num_heads*d_head]
 
     return attn_output;
 }
-
 
 __STATIC_INLINE__ struct ggml_tensor* modulate(struct ggml_context* ctx,
                                                struct ggml_tensor* x,
                                                struct ggml_tensor* shift,
                                                struct ggml_tensor* scale) {
-    // x: [N, L, C] or [N, C]
-    // scale: [N, C] or [N, 1, C]
-    // shift: [N, C] or [N, 1, C]
+    // x: [N, L, C] (target tensor)
+    // scale: [N, C] (modulation params)
+    // shift: [N, C] (modulation params)
 
-    // Reshape scale and shift for broadcasting if x has more dimensions than scale/shift
-    struct ggml_tensor* scale_reshaped = scale;
-    struct ggml_tensor* shift_reshaped = shift;
+    // Reshape scale and shift to [N, 1, C] for broadcasting with x [N, L, C]
+    struct ggml_tensor* scale_reshaped = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]);
+    struct ggml_tensor* shift_reshaped = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, shift->ne[1]);
 
-    if (ggml_n_dims(x) == 3 && ggml_n_dims(scale) == 2) {
-        scale_reshaped = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]); // [C, 1, N]
-        shift_reshaped = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, shift->ne[1]); // [C, 1, N]
-    } else if (ggml_n_dims(x) == 4 && ggml_n_dims(scale) == 2) {
-         scale_reshaped = ggml_reshape_4d(ctx, scale, scale->ne[0], 1, 1, scale->ne[1]); // [C, 1, 1, N]
-         shift_reshaped = ggml_reshape_4d(ctx, shift, shift->ne[0], 1, 1, shift->ne[1]); // [C, 1, 1, N]
-    }
-
-    // Explicitly repeat scale_reshaped and shift_reshaped to match the shape of x
+    // Explicitly repeat for broadcasting (more robust with some ggml backends)
     struct ggml_tensor* scale_repeated = ggml_repeat(ctx, scale_reshaped, x);
     struct ggml_tensor* shift_repeated = ggml_repeat(ctx, shift_reshaped, x);
-
-    // Apply modulation: (1 + scale) * x + shift
-    // Create a tensor of ones with the same shape as scale_repeated for addition
+    
+    // Create a tensor of ones with the same shape as x for (1 + scale)
+    // Or, more directly, (1 + scale_repeated) * x + shift_repeated
+    // struct ggml_tensor* ones_like_x = ggml_dup(ctx, x); // Create a tensor with same metadata
+    // ggml_set_f32(ones_like_x, 1.0f); // this is wrong, ones should be like scale_repeated
+    
     struct ggml_tensor* ones_tensor = ggml_new_tensor(ctx, scale_repeated->type, ggml_n_dims(scale_repeated), scale_repeated->ne);
-    ggml_set_f32(ones_tensor, 1.0f); // Set all elements to 1.0f
+    ggml_set_f32(ones_tensor, 1.0f);
+
 
     struct ggml_tensor* one_plus_scale = ggml_add(ctx, ones_tensor, scale_repeated);
-    struct ggml_tensor* modulated_x = ggml_mul(ctx, x, one_plus_scale);
-    struct ggml_tensor* output = ggml_add(ctx, modulated_x, shift_repeated);
+    struct ggml_tensor* modulated_x = ggml_mul(ctx, x, one_plus_scale); // Element-wise: x * (1 + scale)
+    struct ggml_tensor* output = ggml_add(ctx, modulated_x, shift_repeated);    // Element-wise: x * (1 + scale) + shift
 
     return output;
 }
-// Adapted from Flux::RMSNorm
+
 struct RMSNorm : public UnaryBlock {
 protected:
     int64_t hidden_size;
     float eps;
 
-    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") {
-        // Note: Chroma's LayerNorm/RMSNorm with elementwise_affine=False do not have learnable weights/biases.
-        // This implementation includes weights for potential future use or if the plan's interpretation of elementwise_affine=False is slightly off for RMSNorm.
-        // Based on the plan (Phase 1.2, Approximator), RMSNorm *does* have weights.
+    void init_params(struct ggml_context* ctx, std::map<std::string, enum ggml_type>& tensor_types, const std::string prefix = "") override {
         ggml_type wtype = GGML_TYPE_F32;
-        params["weight"] = ggml_new_tensor_1d(ctx, wtype, hidden_size);
+        if (tensor_types.count(prefix + "scale")) {
+            wtype = tensor_types[prefix + "scale"];
+        }
+        params["scale"] = ggml_new_tensor_1d(ctx, wtype, hidden_size); // Changed "weight" to "scale"
     }
 
 public:
-    RMSNorm(int64_t hidden_size,
-            float eps = 1e-06f)
-        : hidden_size(hidden_size),
-          eps(eps) {}
+    RMSNorm(int64_t hidden_size, float eps = 1e-06f)
+        : hidden_size(hidden_size), eps(eps) {}
 
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) {
-        struct ggml_tensor* w = params["weight"];
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) override {
+        struct ggml_tensor* s = params["scale"]; // Changed "w" to "s" and "weight" to "scale"
         x = ggml_rms_norm(ctx, x, eps);
-        x = ggml_mul(ctx, x, w);
+        x = ggml_mul(ctx, x, s); // Apply scaling
         return x;
     }
 };
 
-// Adapted from Flux::MLPEmbedder
 struct MLPEmbedder : public UnaryBlock {
 public:
     MLPEmbedder(int64_t in_dim, int64_t hidden_dim) {
@@ -153,25 +148,21 @@ public:
         blocks["out_layer"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_dim, hidden_dim, true));
     }
 
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) {
-        // x: [..., in_dim]
-        // return: [..., hidden_dim]
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) override {
         auto in_layer = std::dynamic_pointer_cast<Linear>(blocks["in_layer"]);
         auto out_layer = std::dynamic_pointer_cast<Linear>(blocks["out_layer"]);
 
         x = in_layer->forward(ctx, x);
-        x = ggml_silu_inplace(ctx, x); // Using ggml_silu_inplace as seen in Flux
+        x = ggml_silu_inplace(ctx, x);
         x = out_layer->forward(ctx, x);
         return x;
     }
 };
 
-
-// Based on the plan (Phase 1.2 and 2.5)
 struct Approximator_ggml : public UnaryBlock {
-    int in_dim;
-    int out_dim;
-    int hidden_dim;
+    int in_dim;     // e.g., params.approximator_input_concat_dim
+    int out_dim;    // e.g., params.approximator_feature_dim (mod_vectors_global dim)
+    int hidden_dim; // e.g., params.approximator_internal_hidden_dim
     int n_layers;
 
     Approximator_ggml(int in_dim, int out_dim, int hidden_dim, int n_layers = 5)
@@ -181,52 +172,34 @@ struct Approximator_ggml : public UnaryBlock {
             blocks["layers." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new MLPEmbedder(hidden_dim, hidden_dim));
             blocks["norms." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new RMSNorm(hidden_dim));
         }
-        blocks["out_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_dim , out_dim));
+        blocks["out_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_dim, out_dim, true)); // Bias true for out_proj
     }
 
-
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* timestep) {
-        // Implement forward pass based on the pseudo-code in the plan (Phase 2.2)
+    // timestep_for_approximator_input_vec: [N, L_indices_for_approximator, C_concat_for_approximator_input]
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* timestep_for_approximator_input_vec) override {
         auto in_proj = std::dynamic_pointer_cast<Linear>(blocks["in_proj"]);
         auto out_proj = std::dynamic_pointer_cast<Linear>(blocks["out_proj"]);
 
-        // 1. in_proj_output = ggml_mul_mat(ctx, model.in_proj_weight, timestep);
-        // 2. in_proj_output = ggml_add(ctx, in_proj_output, model.in_proj_bias);
-        struct ggml_tensor* current_input = in_proj->forward(ctx, timestep);
+        struct ggml_tensor* current_input = in_proj->forward(ctx, timestep_for_approximator_input_vec);
 
-        // 3. Loop through layers:
         for (int i = 0; i < n_layers; ++i) {
             auto layer = std::dynamic_pointer_cast<MLPEmbedder>(blocks["layers." + std::to_string(i)]);
             auto norm = std::dynamic_pointer_cast<RMSNorm>(blocks["norms." + std::to_string(i)]);
-
-            // *   norm_output = ggml_rms_norm(ctx, current_input, 1e-6f); (using the appropriate RMSNorm weight and an epsilon of 1e-6f)
-            struct ggml_tensor* norm_output = norm->forward(ctx, current_input); // RMSNorm forward handles weight and epsilon
-
-            // *   mlp_output = ggml_mul_mat(ctx, model.mlp_embedder_weights[i], norm_output);
-            // *   mlp_output = ggml_add(ctx, mlp_output, model.mlp_embedder_biases[i]);
+            
+            struct ggml_tensor* norm_output = norm->forward(ctx, current_input);
             struct ggml_tensor* mlp_output = layer->forward(ctx, norm_output);
-
-            // *   current_input = ggml_add(ctx, current_input, mlp_output); (skip connection)
             current_input = ggml_add(ctx, current_input, mlp_output);
         }
-        
-        // 4. out_proj_output = ggml_mul_mat(ctx, model.out_proj_weight, current_input);
-        // 5. out_proj_output = ggml_add(ctx, out_proj_output, model.out_proj_bias);
         struct ggml_tensor* out_proj_output = out_proj->forward(ctx, current_input);
-
-        // 6. Return out_proj_output.
-        return out_proj_output;
+        return out_proj_output; // This is mod_vectors_global
     }
 };
 
-// Basic struct definitions for other Chroma modules, inheriting from appropriate base classes
-
-// Based on the plan (Phase 1.2 and 2.5)
 struct QKNorm : public GGMLBlock {
-    int64_t dim;
-    QKNorm(int64_t dim) : dim(dim) {
-        blocks["query_norm"] = std::shared_ptr<GGMLBlock>(new RMSNorm(dim));
-        blocks["key_norm"] = std::shared_ptr<GGMLBlock>(new RMSNorm(dim));
+    int64_t head_dim; // QKNorm operates on head_dim
+    QKNorm(int64_t head_dim) : head_dim(head_dim) {
+        blocks["query_norm"] = std::shared_ptr<GGMLBlock>(new RMSNorm(head_dim));
+        blocks["key_norm"] = std::shared_ptr<GGMLBlock>(new RMSNorm(head_dim));
     }
 
     struct ggml_tensor* query_norm(struct ggml_context* ctx, struct ggml_tensor* x) {
@@ -238,699 +211,529 @@ struct QKNorm : public GGMLBlock {
         auto norm = std::dynamic_pointer_cast<RMSNorm>(blocks["key_norm"]);
         return norm->forward(ctx, x);
     }
-
 };
 
-// Based on the plan (Phase 1.2 and 2.5)
 struct SelfAttention : public GGMLBlock {
-    int64_t dim;
+    int64_t dim; // model_dim (e.g., 3072)
     int64_t num_heads;
+    int64_t head_dim; // dim / num_heads
     bool qkv_bias;
 
     SelfAttention(int64_t dim, int64_t num_heads, bool qkv_bias = false)
         : dim(dim), num_heads(num_heads), qkv_bias(qkv_bias) {
-        int64_t head_dim = dim / num_heads;
+        GGML_ASSERT(dim % num_heads == 0);
+        this->head_dim = dim / num_heads;
         blocks["qkv"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim * 3, qkv_bias));
-        blocks["norm"] = std::shared_ptr<GGMLBlock>(new QKNorm(head_dim));
-        blocks["proj"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim));
+        blocks["norm"] = std::shared_ptr<GGMLBlock>(new QKNorm(head_dim)); // QKNorm uses head_dim
+        blocks["proj"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim, true)); // Proj bias is true
     }
-    std::vector<struct ggml_tensor*> pre_attention(struct ggml_context* ctx, struct ggml_tensor* x) {
-        auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv"]);
-        auto norm = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
 
-        auto qkv = qkv_proj->forward(ctx, x); // [N, L, dim*3]
-        // Split qkv into q, k, v [N, L, dim]
+    // Returns: q, k, v (each [d_head, L, N*n_head])
+    std::vector<struct ggml_tensor*> pre_attention(struct ggml_context* ctx, struct ggml_tensor* x) {
+        // x: [N, L, dim]
+        auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv"]);
+        auto norm_block = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
+
+        auto qkv_combined = qkv_proj->forward(ctx, x); // [N, L, dim*3]
+
         int64_t N = x->ne[2];
         int64_t L = x->ne[1];
-        int64_t dim = x->ne[0];
-        int64_t head_dim = dim / num_heads;
 
-        auto qkv_split = ggml_reshape_4d(ctx, qkv, dim, 3, L, N); // [N, L, dim*3] -> [dim, 3, L, N]
-        qkv_split = ggml_cont(ctx, ggml_permute(ctx, qkv_split, 0, 2, 1, 3)); // [dim, 3, L, N] -> [dim, L, 3, N]
+        // Reshape and split
+        // qkv_combined: [N, L, dim*3] -> [dim*3, L, N]
+        qkv_combined = ggml_cont(ctx, ggml_permute(ctx, qkv_combined, 2, 1, 0, 3)); 
+        // -> [dim, 3, L, N]
+        qkv_combined = ggml_reshape_4d(ctx, qkv_combined, dim, 3, L, N);
+        
+        int64_t s2 = qkv_combined->nb[2]; // stride for L
+        int64_t s1 = qkv_combined->nb[1]; // stride for 3
 
-        int64_t offset = qkv_split->nb[2] * qkv_split->ne[2];
-        auto q = ggml_view_3d(ctx, qkv_split, dim, L, N, qkv_split->nb[1], qkv_split->nb[2], offset * 0); // [dim, L, N]
-        auto k = ggml_view_3d(ctx, qkv_split, dim, L, N, qkv_split->nb[1], qkv_split->nb[2], offset * 1); // [dim, L, N]
-        auto v = ggml_view_3d(ctx, qkv_split, dim, L, N, qkv_split->nb[1], qkv_split->nb[2], offset * 2); // [dim, L, N]
+        struct ggml_tensor* q = ggml_view_3d(ctx, qkv_combined, dim, L, N, s2, qkv_combined->nb[3], 0*s1);
+        struct ggml_tensor* k = ggml_view_3d(ctx, qkv_combined, dim, L, N, s2, qkv_combined->nb[3], 1*s1);
+        struct ggml_tensor* v = ggml_view_3d(ctx, qkv_combined, dim, L, N, s2, qkv_combined->nb[3], 2*s1);
+        
+        // Reshape q, k, v for QKNorm and attention: [d_head, L, N*n_head]
+        q = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, q, 1, 2, 0, 3)), head_dim, L, N * num_heads); // [N, L, dim] -> [d_head, L, N*n_head]
+        k = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, k, 1, 2, 0, 3)), head_dim, L, N * num_heads);
+        v = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)), head_dim, L, N * num_heads);
 
-        // Reshape q, k, v for QKNorm and ggml_nn_attention_ext
-        // QKNorm expects [..., dim], ggml_nn_attention_ext expects [d_head, L, N*n_head] or similar depending on implementation
-        // Let's reshape q, k, v to [d_head, L, N*n_head] and [d_head, L, n_head, N] respectively
 
-        auto q_reshaped = ggml_reshape_3d(ctx, q, head_dim, L, N * num_heads); // [dim, L, N] -> [d_head, L, N*n_head]
-        auto k_reshaped = ggml_reshape_3d(ctx, k, head_dim, L, N * num_heads); // [dim, L, N] -> [d_head, L, N*n_head]
-        auto v_reshaped = ggml_reshape_4d(ctx, v, head_dim, L, num_heads, N); // [dim, L, N] -> [d_head, L, n_head, N]
-
-        // Apply QKNorm to q and k
-        auto q_normed = norm->query_norm(ctx, q_reshaped);
-        auto k_normed = norm->key_norm(ctx, k_reshaped);
-
-        return {q_normed, k_normed, v_reshaped};
+        struct ggml_tensor* q_normed = norm_block->query_norm(ctx, q);
+        struct ggml_tensor* k_normed = norm_block->key_norm(ctx, k);
+        
+        return {q_normed, k_normed, v};
     }
 
     struct ggml_tensor* post_attention(struct ggml_context* ctx, struct ggml_tensor* x) {
+        // x: [N, L, dim] (after attention and reshape)
         auto proj = std::dynamic_pointer_cast<Linear>(blocks["proj"]);
-        return proj->forward(ctx, x); // [N, L, dim]
-    }
-
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x, struct ggml_tensor* pe, struct ggml_tensor* attn_mask = NULL) {
-        // x: [N, L, dim]
-        // pe: Positional embeddings (shape TBD)
-        // attn_mask: Attention mask (shape TBD)
-        // return [N, L, dim]
-
-        auto qkv_vec = pre_attention(ctx, x); // q, k: [d_head, L, N*n_head], v: [d_head, L, n_head, N]
-        auto q = qkv_vec[0];
-        auto k = qkv_vec[1];
-        auto v = qkv_vec[2];
-
-        // Compute attention using ggml_nn_attention_ext
-        // ggml_nn_attention_ext handles internal reshaping/permuting and RoPE if skip_reshape is false
-        struct ggml_tensor* attn_output = ggml_nn_attention_ext(ctx, q, k, v, num_heads, attn_mask, false, false, true); // Assuming flash_attn=true
-
-        // Apply post-attention projection
-        struct ggml_tensor* output = post_attention(ctx, attn_output); // [N, L, dim]
-
-        return output;
+        return proj->forward(ctx, x);
     }
 };
 
-// Based on the plan (Phase 1.2 and 2.5)
-struct ModulationOut {
+
+struct ModulationOut { // This struct is fine
     ggml_tensor* shift = NULL;
     ggml_tensor* scale = NULL;
     ggml_tensor* gate  = NULL;
-
-    ModulationOut(ggml_tensor* shift = NULL, ggml_tensor* scale = NULL, ggml_tensor* gate = NULL)
-        : shift(shift), scale(scale), gate(gate) {}
+    ModulationOut(ggml_tensor*s=0, ggml_tensor*sc=0, ggml_tensor*g=0):shift(s),scale(sc),gate(g){}
 };
 
-// Struct to hold Chroma-specific conditioning data
-struct ChromaCondition {
-    ggml_tensor* txt_embeddings = NULL;
-    ggml_tensor* t5_padding_mask = NULL;
+enum class ModulationOutputType {
+    SINGLE,
+    DOUBLE,
+    FINAL
 };
 
-// Based on the plan (Phase 3.1)
-__STATIC_INLINE__ struct ggml_tensor* generate_t5_padding_mask_ggml(ggml_context* ctx, const std::vector<int>& tokens, int image_sequence_length, int num_heads) {
-    // The mask should be 0 for valid tokens and -INFINITY for padding tokens.
-    // The shape of the mask should be (1, num_heads, image_sequence_length, tokens.size()).
-    // This implies ne0 = tokens.size(), ne1 = image_sequence_length, ne2 = num_heads, ne3 = 1.
+struct BlockModulationOutput {
+    ModulationOutputType type;
+    ModulationOut single_mod;
+    std::pair<ModulationOut, ModulationOut> double_mods;
+    std::pair<ggml_tensor*, ggml_tensor*> final_mods;
+};
 
-    // Create a new tensor for the mask
-    ggml_tensor* mask_tensor = ggml_new_tensor_4d(
-        ctx,
-        GGML_TYPE_F32, // Mask is typically float
-        tokens.size(),         // ne0: text sequence length
-        image_sequence_length, // ne1: image sequence length
-        num_heads,             // ne2: number of heads
-        1                      // ne3: batch size (always 1 for this context)
-    );
 
-    // Initialize the mask tensor with zeros (representing valid tokens)
-    ggml_set_zero(mask_tensor);
+// C++ equivalent of ChromaModulationOut.from_offset and part of get_modulations
+// mod_vectors is [N, mod_vector_total_indices, approximator_feature_dim]
+// approximator_feature_dim should be == unet_model_dim (3072)
+__STATIC_INLINE__ ModulationOut get_modulation_params_from_offset(
+    ggml_context* ctx,
+    ggml_tensor* mod_vectors, // Shape: [approximator_feature_dim, mod_vector_total_indices, N] (after permute)
+    int offset_idx // Index along the mod_vector_total_indices dimension
+) {
+    // mod_vectors is [N, total_indices, feature_dim]
+    // We want to slice along total_indices dimension
+    // After permute to [feature_dim, total_indices, N] for easier viewing with ggml_view_2d
 
-    // Define a large negative value to represent masking
-    const float negative_infinity = -1e9; // Use a large negative number representable in F32
+    int64_t feature_dim = mod_vectors->ne[0]; // Should be unet_model_dim
+    int64_t total_indices = mod_vectors->ne[1];
+    int64_t N = mod_vectors->ne[2]; // Batch size
 
-    // T5 padding token ID is 0 based on t5.hpp
-    const int t5_padding_token_id = 0;
+    // Stride for the 'total_indices' dimension
+    size_t stride_indices = mod_vectors->nb[1];
 
-    float* mask_data = ggml_get_data_f32(mask_tensor);
+    // Shift: mod_vectors[:, offset_idx, :]
+    ggml_tensor* shift = ggml_view_2d(ctx, mod_vectors,
+                                     feature_dim, N,
+                                     stride_indices, // Stride to jump one full feature_dim * N block
+                                     offset_idx * mod_vectors->nb[1]); // Offset to the start of the desired "row"
 
-    // Iterate through the text tokens to identify padding tokens
-    for (int j = 0; j < tokens.size(); ++j) {
-        if (tokens[j] == t5_padding_token_id) {
-            // If the j-th token is a padding token, mask all attention scores
-            // from image tokens to this padding token across all heads.
-            // The mask shape is (1, num_heads, image_sequence_length, tokens.size()).
-            // This means for each head (k), and for each image token (i),
-            // if the j-th text token is padding, set mask_tensor[0][k][i][j] to -INFINITY.
+    // Scale: mod_vectors[:, offset_idx + 1, :]
+    ggml_tensor* scale = ggml_view_2d(ctx, mod_vectors,
+                                     feature_dim, N,
+                                     stride_indices,
+                                     (offset_idx + 1) * mod_vectors->nb[1]);
 
-            // The ggml_tensor data is typically stored in row-major order for 4D tensors:
-            // data[n3 * s3 + n2 * s2 + n1 * s1 + n0 * s0]
-            // where s0 = 1, s1 = ne0, s2 = ne0 * ne1, s3 = ne0 * ne1 * ne2
-            // For our mask_tensor:
-            // ne0 = tokens.size()
-            // ne1 = image_sequence_length
-            // ne2 = num_heads
-            // ne3 = 1 (batch size)
+    // Gate: mod_vectors[:, offset_idx + 2, :]
+    ggml_tensor* gate  = ggml_view_2d(ctx, mod_vectors,
+                                     feature_dim, N,
+                                     stride_indices,
+                                     (offset_idx + 2) * mod_vectors->nb[1]);
+    // These views are [feature_dim, N]. Need to permute to [N, feature_dim] for modulate function
+    shift = ggml_cont(ctx, ggml_permute(ctx, shift, 1,0,2,3));
+    scale = ggml_cont(ctx, ggml_permute(ctx, scale, 1,0,2,3));
+    gate  = ggml_cont(ctx, ggml_permute(ctx, gate,  1,0,2,3));
 
-            // Index calculation: mask_data[ (batch_idx * ne2 * ne1 * ne0) + (head_idx * ne1 * ne0) + (image_idx * ne0) + text_idx ]
-            // Since batch_idx is always 0:
-            // mask_data[ (head_idx * image_sequence_length * tokens.size()) + (image_idx * tokens.size()) + text_idx ]
-
-            for (int k = 0; k < num_heads; ++k) { // Iterate over heads
-                for (int i = 0; i < image_sequence_length; ++i) { // Iterate over image sequence length
-                    // Calculate the index in the flattened mask data
-                    int index = (k * image_sequence_length * tokens.size()) + (i * tokens.size()) + j;
-                    mask_data[index] = negative_infinity;
-                }
-            }
-        }
-    }
-
-    return mask_tensor;
+    return ModulationOut(shift, scale, gate);
 }
 
 
-// Based on the plan (Phase 1.2 and 2.5)
-struct Modulation : public GGMLBlock {
-    int64_t dim;
-    bool is_double;
-    int multiplier;
+// Wrapper similar to Python's get_modulations
+// mod_vectors_input is [N, mod_vector_total_indices, approximator_feature_dim]
+__STATIC_INLINE__ BlockModulationOutput get_modulations_for_block(
+    ggml_context* ctx,
+    const ChromaParams& params,      // To get depth_single_blocks, depth_double_blocks
+    ggml_tensor* mod_vectors_input,  // Output of Approximator
+    const std::string& block_type,
+    int block_idx
+) {
+    BlockModulationOutput output;
 
-    Modulation(int64_t dim, bool is_double)
-        : dim(dim), is_double(is_double) {
-        multiplier = is_double ? 6 : 3;
-        blocks["lin"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim * multiplier));
-    }
+    // Permute mod_vectors_input from [N, total_indices, feature_dim] to [feature_dim, total_indices, N]
+    // for easier slicing with ggml_view_2d.
+    ggml_tensor* mod_vectors = ggml_cont(ctx, ggml_permute(ctx, mod_vectors_input, 2, 1, 0, 3));
 
-    std::vector<ModulationOut> forward(struct ggml_context* ctx, struct ggml_tensor* vec) {
-        auto lin = std::dynamic_pointer_cast<Linear>(blocks["lin"]);
 
-        auto out = ggml_silu(ctx, vec);
-        out      = lin->forward(ctx, out);  // [N, multiplier*dim]
-
-        auto m = ggml_reshape_3d(ctx, out, vec->ne[0], multiplier, vec->ne[1]);  // [N, multiplier, dim]
-        m      = ggml_cont(ctx, ggml_permute(ctx, m, 0, 2, 1, 3));               // [multiplier, N, dim]
-
-        int64_t offset = m->nb[1] * m->ne[1];
-        auto shift_0   = ggml_view_2d(ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 0);  // [N, dim]
-        auto scale_0   = ggml_view_2d(ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 1);  // [N, dim]
-        auto gate_0    = ggml_view_2d(ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 2);  // [N, dim]
-
-        if (is_double) {
-            auto shift_1 = ggml_view_2d(ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 3);  // [N, dim]
-            auto scale_1 = ggml_view_2d(ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 4);  // [N, dim]
-            auto gate_1  = ggml_view_2d(ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 5);  // [N, dim]
-            return {ModulationOut(shift_0, scale_0, gate_0), ModulationOut(shift_1, scale_1, gate_1)};
-        }
-
-        return {ModulationOut(shift_0, scale_0, gate_0), ModulationOut()};
-    }
-};
-
-// Based on the plan (Phase 1.2 and 2.5)
-struct SingleStreamBlock_ggml : public GGMLBlock {
-    int64_t hidden_size;
-    int64_t num_heads;
-    float mlp_ratio;
-    float qk_scale;
-
-    SingleStreamBlock_ggml(int64_t hidden_size, int64_t num_heads, float mlp_ratio = 4.0f, float qk_scale = 0.f)
-        : hidden_size(hidden_size), num_heads(num_heads), mlp_ratio(mlp_ratio), qk_scale(qk_scale) {
-        int64_t head_dim = hidden_size / num_heads;
-        float scale = qk_scale;
-        if (scale <= 0.f) {
-            scale = 1.0f / std::sqrt((float)head_dim);
-        }
-
-        int64_t mlp_hidden_dim = hidden_size * mlp_ratio;
-
-        blocks["linear1"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size * 3 + mlp_hidden_dim));
-        blocks["linear2"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size + mlp_hidden_dim, hidden_size));
-        blocks["norm"] = std::shared_ptr<GGMLBlock>(new QKNorm(head_dim));
-        blocks["pre_norm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false)); // elementwise_affine=False
-        // mlp_act is nn.GELU(approximate="tanh") - handled by ggml_gelu
-        // Modulation block is created and called in the forward pass based on the plan
-    }
-
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x, struct ggml_tensor* pe, struct ModulationOut& mod, struct ggml_tensor* attn_mask = NULL) {
-        // x: [N, L, hidden_size]
-        // pe: Positional embeddings (shape TBD)
-        // mod: Modulation parameters (scale, shift, gate)
-        // attn_mask: Attention mask (optional)
-        // return: [N, L, hidden_size]
-
-        auto linear1 = std::dynamic_pointer_cast<Linear>(blocks["linear1"]);
-        auto linear2 = std::dynamic_pointer_cast<Linear>(blocks["linear2"]);
-        auto norm = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
-        auto pre_norm = std::dynamic_pointer_cast<LayerNorm>(blocks["pre_norm"]);
-
-        // 1. Apply pre-normalization and modulation
-        struct ggml_tensor* x_norm = pre_norm->forward(ctx, x); // [N, L, hidden_size]
-        struct ggml_tensor* x_mod = Chroma::modulate(ctx, x_norm, mod.shift, mod.scale); // [N, L, hidden_size]
-
-        // 2. Pass modulated input through linear1 to get combined QKV and MLP input
-        struct ggml_tensor* linear1_output = linear1->forward(ctx, x_mod); // [N, L, hidden_size * 3 + mlp_hidden_dim]
+    if (block_type == "final") {
+        output.type = ModulationOutputType::FINAL;
+        // Python: return (tensor[:, -2:-1, :], tensor[:, -1:, :])
+        // Assuming -1 is total_indices-1, -2 is total_indices-2
+        int64_t last_idx = params.mod_vector_total_indices - 1;
+        int64_t second_last_idx = params.mod_vector_total_indices - 2;
         
-        // 3. Split linear1 output into QKV and MLP input tensors
-        // 4. Reshape QKV tensors and apply QKNorm to Q and K
-        int64_t N = x->ne[2];
-        int64_t L = x->ne[1];
-        int64_t hidden_size = x->ne[0];
-        int64_t head_dim = hidden_size / num_heads;
-        int64_t mlp_hidden_dim = linear1_output->ne[0] - hidden_size * 3;
+        ggml_tensor* scale_final = ggml_view_2d(ctx, mod_vectors, params.approximator_feature_dim, mod_vectors->ne[2], mod_vectors->nb[1], second_last_idx * mod_vectors->nb[1]);
+        ggml_tensor* shift_final = ggml_view_2d(ctx, mod_vectors, params.approximator_feature_dim, mod_vectors->ne[2], mod_vectors->nb[1], last_idx * mod_vectors->nb[1]);
+        
+        scale_final = ggml_cont(ctx, ggml_permute(ctx, scale_final, 1,0,2,3)); // [N, feature_dim]
+        shift_final = ggml_cont(ctx, ggml_permute(ctx, shift_final, 1,0,2,3)); // [N, feature_dim]
 
-        struct ggml_tensor* qkv_mlp_split = ggml_reshape_4d(ctx, linear1_output, hidden_size * 3 + mlp_hidden_dim, 1, L, N); // [N, L, total_dim] -> [total_dim, 1, L, N]
-        qkv_mlp_split = ggml_cont(ctx, ggml_permute(ctx, qkv_mlp_split, 0, 2, 1, 3)); // [total_dim, 1, L, N] -> [total_dim, L, 1, N]
+        output.final_mods = std::make_pair(shift_final, scale_final); // Order might be shift, scale based on LastLayer.forward
+        return output;
+    }
 
-        struct ggml_tensor* qkv = ggml_view_3d(ctx, qkv_mlp_split, hidden_size * 3, L, N, qkv_mlp_split->nb[1], qkv_mlp_split->nb[2], 0); // [hidden_size*3, L, N]
-        struct ggml_tensor* mlp_input = ggml_view_3d(ctx, qkv_mlp_split, mlp_hidden_dim, L, N, qkv_mlp_split->nb[1], qkv_mlp_split->nb[2], qkv_mlp_split->nb[2] * hidden_size * 3); // [mlp_hidden_dim, L, N]
+    int single_block_count = params.depth_single_blocks;
+    int double_block_count = params.depth; // Python uses self.params.depth
+    int offset_s_s_g = 0; // This is the 'idx' argument for from_offset in python
 
-        qkv = ggml_cont(ctx, ggml_permute(ctx, qkv, 1, 2, 0, 3)); // [hidden_size*3, L, N] -> [N, L, hidden_size*3]
-        mlp_input = ggml_cont(ctx, ggml_permute(ctx, mlp_input, 1, 2, 0, 3)); // [mlp_hidden_dim, L, N] -> [N, L, mlp_hidden_dim]
+    if (block_type == "single") {
+        output.type = ModulationOutputType::SINGLE;
+        offset_s_s_g = 3 * block_idx;
+        output.single_mod = get_modulation_params_from_offset(ctx, mod_vectors, offset_s_s_g);
+        return output;
+    }
+
+    offset_s_s_g = 3 * block_idx * 2; // Python: offset *= 2 (which means 3*idx*2)
+
+    if (block_type == "double_img" || block_type == "double_txt") {
+        output.type = ModulationOutputType::DOUBLE;
+        offset_s_s_g += 3 * single_block_count; // Advance past single block modulations
+        if (block_type == "double_txt") {
+            offset_s_s_g += 6 * double_block_count; // Advance past double_img block modulations (6 params per double block: mod1(s,s,g) + mod2(s,s,g))
+        }
+        ModulationOut mod1 = get_modulation_params_from_offset(ctx, mod_vectors, offset_s_s_g);
+        ModulationOut mod2 = get_modulation_params_from_offset(ctx, mod_vectors, offset_s_s_g + 3);
+        output.double_mods = std::make_pair(mod1, mod2);
+        return output;
+    }
+
+    throw std::runtime_error("Bad block_type in get_modulations_for_block: " + block_type);
+}
 
 
-        struct ggml_tensor* qkv_reshaped = ggml_reshape_4d(ctx, qkv, head_dim, num_heads, L, N); // [N, L, hidden_size*3] -> [d_head, n_head, L, N]
-        qkv_reshaped = ggml_cont(ctx, ggml_permute(ctx, qkv_reshaped, 0, 2, 1, 3)); // [d_head, n_head, L, N] -> [d_head, L, n_head, N]
+// SingleStreamBlock uses the new modulation
+struct SingleStreamBlock_ggml : public GGMLBlock {
+    int64_t hidden_size, num_heads, head_dim; float mlp_ratio;
+    // No internal Modulation block needed anymore
+    SingleStreamBlock_ggml(int64_t hs, int64_t nh, float mr)
+        : hidden_size(hs), num_heads(nh), mlp_ratio(mr) {
+        GGML_ASSERT(hs % nh == 0); head_dim = hs / nh;
+        int64_t mlp_hd = static_cast<int64_t>(hs * mr);
+        blocks["pre_norm"]=std::shared_ptr<GGMLBlock>(new LayerNorm(hs,1e-6f,false));
+        blocks["linear1"]=std::shared_ptr<GGMLBlock>(new Linear(hs,hs*3+mlp_hd,true));
+        blocks["norm"]=std::shared_ptr<GGMLBlock>(new QKNorm(head_dim));
+        blocks["linear2"]=std::shared_ptr<GGMLBlock>(new Linear(hs+mlp_hd,hs,true));
+    }
 
-        int64_t qkv_offset = qkv_reshaped->nb[2] * qkv_reshaped->ne[2];
-        struct ggml_tensor* q = ggml_view_3d(ctx, qkv_reshaped, head_dim, L, N * num_heads, qkv_reshaped->nb[1], qkv_reshaped->nb[2], qkv_offset * 0); // [d_head, L, N*n_head]
-        struct ggml_tensor* k = ggml_view_3d(ctx, qkv_reshaped, head_dim, L, N * num_heads, qkv_reshaped->nb[1], qkv_reshaped->nb[2], qkv_offset * 1); // [d_head, L, N*n_head]
-        struct ggml_tensor* v = ggml_view_3d(ctx, qkv_reshaped, head_dim, L, N * num_heads, qkv_reshaped->nb[1], qkv_reshaped->nb[2], qkv_offset * 2); // [d_head, L, N*n_head]
+    // vec_mod_params IS the ModulationOut struct with s,s,g for this block
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x, struct ggml_tensor* pe, const ModulationOut& vec_mod_params, struct ggml_tensor* attn_mask = NULL) {
+        auto pn=std::dynamic_pointer_cast<LayerNorm>(blocks["pre_norm"]);
+        auto l1=std::dynamic_pointer_cast<Linear>(blocks["linear1"]);
+        auto qn=std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
+        auto l2=std::dynamic_pointer_cast<Linear>(blocks["linear2"]);
 
-        struct ggml_tensor* q_normed = norm->query_norm(ctx, q);
-        struct ggml_tensor* k_normed = norm->key_norm(ctx, k);
-
-        // 5. Compute self-attention
-        struct ggml_tensor* attn_output = attention(ctx, q_normed, k_normed, v, pe, attn_mask); // [N, L, hidden_size]
-
-        // 6. Apply GELU activation to MLP input
-        struct ggml_tensor* mlp_act_output = ggml_gelu_inplace(ctx, mlp_input); // [N, L, mlp_hidden_dim]
-
-        // 7. Concatenate attention output and activated MLP output
-        struct ggml_tensor* concatenated_output = ggml_concat(ctx, attn_output, mlp_act_output, 0); // [N, L, hidden_size + mlp_hidden_dim]
-
-        // 8. Pass the concatenated tensor through linear2
-        struct ggml_tensor* linear2_output = linear2->forward(ctx, concatenated_output); // [N, L, hidden_size]
-
-        // 9. Apply modulation and add a skip connection
-        struct ggml_tensor* output = ggml_add(ctx, x, ggml_mul(ctx, linear2_output, mod.gate)); // [N, L, hidden_size]
-
-        // 10. Handle potential NaN values (monitoring needed)
-
+        struct ggml_tensor* xn=pn->forward(ctx,x);
+        // Ensure shift/scale are [N, C] or broadcastable from [N,1,C] to xn [N,L,C]
+        // Python: mod.scale is [N,1,C], shift is [N,1,C] after ChromaModulationOut.from_offset
+        // The get_modulation_params_from_offset already returns them as [N, C].
+        // The modulate function will reshape them to [N,1,C] if x is [N,L,C]
+        struct ggml_tensor* xm = Chroma::modulate(ctx, xn, vec_mod_params.shift, vec_mod_params.scale);
+        
+        struct ggml_tensor* l1o=l1->forward(ctx,xm);
+        int64_t N=x->ne[2], L=x->ne[1], mlp_hda=static_cast<int64_t>(hidden_size*mlp_ratio);
+        struct ggml_tensor* pl1o=ggml_cont(ctx,ggml_permute(ctx,l1o,2,1,0,3));
+        struct ggml_tensor* qkvp=ggml_view_3d(ctx,pl1o,hidden_size*3,L,N,pl1o->nb[1],pl1o->nb[2],0);
+        qkvp=ggml_cont(ctx,ggml_permute(ctx,qkvp,2,1,0,3));
+        struct ggml_tensor* mlpp=ggml_view_3d(ctx,pl1o,mlp_hda,L,N,pl1o->nb[1],pl1o->nb[2],pl1o->nb[0]*(hidden_size*3));
+        mlpp=ggml_cont(ctx,ggml_permute(ctx,mlpp,2,1,0,3));
+        struct ggml_tensor* qkvpr=ggml_reshape_4d(ctx,ggml_cont(ctx,ggml_permute(ctx,qkvp,2,1,0,3)),hidden_size,3,L,N);
+        int64_t s2q=qkvpr->nb[2],s1q=qkvpr->nb[1];
+        auto q_=ggml_view_3d(ctx,qkvpr,hidden_size,L,N,s2q,qkvpr->nb[3],0*s1q);
+        auto k_=ggml_view_3d(ctx,qkvpr,hidden_size,L,N,s2q,qkvpr->nb[3],1*s1q);
+        auto v_=ggml_view_3d(ctx,qkvpr,hidden_size,L,N,s2q,qkvpr->nb[3],2*s1q);
+        q_=ggml_reshape_3d(ctx,ggml_cont(ctx,ggml_permute(ctx,q_,1,2,0,3)),head_dim,L,N*num_heads);
+        k_=ggml_reshape_3d(ctx,ggml_cont(ctx,ggml_permute(ctx,k_,1,2,0,3)),head_dim,L,N*num_heads);
+        v_=ggml_reshape_3d(ctx,ggml_cont(ctx,ggml_permute(ctx,v_,1,2,0,3)),head_dim,L,N*num_heads);
+        q_=qn->query_norm(ctx,q_); k_=qn->key_norm(ctx,k_);
+        struct ggml_tensor* ao=Chroma::attention(ctx,q_,k_,v_,pe,num_heads,attn_mask);
+        struct ggml_tensor* mao=ggml_gelu_inplace(ctx,mlpp);
+        struct ggml_tensor* co=ggml_concat(ctx,ao,mao,2);
+        struct ggml_tensor* l2o=l2->forward(ctx,co);
+        struct ggml_tensor* gadd = ggml_mul(ctx,l2o,vec_mod_params.gate);
+        struct ggml_tensor* output = x;
+        if (ggml_are_same_shape(x, gadd)) { output = ggml_add(ctx, x, gadd); }
+        else { fprintf(stderr, "SSB skip shape mismatch\n"); }
         return output;
     }
 };
 
-// Based on the plan (Phase 1.2 and 2.5)
-struct DoubleStreamBlock_ggml : public GGMLBlock { // DoubleStreamBlock forward returns a pair, so it doesn't fit UnaryBlock
-    int64_t hidden_size;
-    int64_t num_heads;
-    float mlp_ratio;
-    bool qkv_bias;
-    bool flash_attn;
 
-    DoubleStreamBlock_ggml(int64_t hidden_size,
-                           int64_t num_heads,
-                           float mlp_ratio,
-                           bool qkv_bias   = false,
-                           bool flash_attn = false)
-        : hidden_size(hidden_size), num_heads(num_heads), mlp_ratio(mlp_ratio), qkv_bias(qkv_bias), flash_attn(flash_attn) {
-        int64_t mlp_hidden_dim = hidden_size * mlp_ratio;
-        blocks["img_norm1"]    = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-        blocks["img_attn"]     = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias));
-
-        blocks["img_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-        blocks["img_mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, mlp_hidden_dim));
-        blocks["img_mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(mlp_hidden_dim, hidden_size));
-
-        blocks["txt_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-        blocks["txt_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias));
-
-        blocks["txt_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-        blocks["txt_mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, mlp_hidden_dim));
-        blocks["txt_mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(mlp_hidden_dim, hidden_size));
+struct DoubleStreamBlock_ggml : public GGMLBlock {
+    int64_t hidden_size, num_heads; float mlp_ratio; bool qkv_bias;
+    // No internal Modulation blocks
+    DoubleStreamBlock_ggml(int64_t hs, int64_t nh, float mr, bool qb=true)
+        : hidden_size(hs), num_heads(nh), mlp_ratio(mr), qkv_bias(qb) {
+        int64_t mlp_hd = static_cast<int64_t>(hs*mr);
+        blocks["img_norm1"]=std::shared_ptr<GGMLBlock>(new LayerNorm(hs,1e-6f,false));
+        blocks["img_attn"]=std::shared_ptr<GGMLBlock>(new SelfAttention(hs,nh,qb));
+        blocks["img_norm2"]=std::shared_ptr<GGMLBlock>(new LayerNorm(hs,1e-6f,false));
+        blocks["img_mlp.0"]=std::shared_ptr<GGMLBlock>(new Linear(hs,mlp_hd,true));
+        blocks["img_mlp.2"]=std::shared_ptr<GGMLBlock>(new Linear(mlp_hd,hs,true));
+        blocks["txt_norm1"]=std::shared_ptr<GGMLBlock>(new LayerNorm(hs,1e-6f,false));
+        blocks["txt_attn"]=std::shared_ptr<GGMLBlock>(new SelfAttention(hs,nh,qb));
+        blocks["txt_norm2"]=std::shared_ptr<GGMLBlock>(new LayerNorm(hs,1e-6f,false));
+        blocks["txt_mlp.0"]=std::shared_ptr<GGMLBlock>(new Linear(hs,mlp_hd,true));
+        blocks["txt_mlp.2"]=std::shared_ptr<GGMLBlock>(new Linear(mlp_hd,hs,true));
     }
 
-    std::pair<struct ggml_tensor*, struct ggml_tensor*> forward(struct ggml_context* ctx, struct ggml_tensor* img, struct ggml_tensor* txt, struct ggml_tensor* pe, const std::vector<ModulationOut>& img_mods, const std::vector<ModulationOut>& txt_mods, struct ggml_tensor* attn_mask = NULL) {
-        auto img_norm1 = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"]);
-        auto img_attn  = std::dynamic_pointer_cast<SelfAttention>(blocks["img_attn"]);
+    // vec_img_mods and vec_txt_mods are std::pair<ModulationOut, ModulationOut>
+    std::pair<struct ggml_tensor*, struct ggml_tensor*> forward(
+        struct ggml_context* ctx, struct ggml_tensor* img, struct ggml_tensor* txt,
+        struct ggml_tensor* pe,
+        const std::pair<ModulationOut, ModulationOut>& vec_img_mods,
+        const std::pair<ModulationOut, ModulationOut>& vec_txt_mods,
+        struct ggml_tensor* attn_mask = NULL
+    ) {
+        ModulationOut img_mod1 = vec_img_mods.first;
+        ModulationOut img_mod2 = vec_img_mods.second;
+        ModulationOut txt_mod1 = vec_txt_mods.first;
+        ModulationOut txt_mod2 = vec_txt_mods.second;
 
-        auto img_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"]);
-        auto img_mlp_0 = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.0"]);
-        auto img_mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.2"]);
+        auto in1=std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"]);
+        auto ia=std::dynamic_pointer_cast<SelfAttention>(blocks["img_attn"]);
+        auto in2=std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"]);
+        auto im0=std::dynamic_pointer_cast<Linear>(blocks["img_mlp.0"]);
+        auto im2=std::dynamic_pointer_cast<Linear>(blocks["img_mlp.2"]);
+        auto tn1=std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm1"]);
+        auto ta=std::dynamic_pointer_cast<SelfAttention>(blocks["txt_attn"]);
+        auto tn2=std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm2"]);
+        auto tm0=std::dynamic_pointer_cast<Linear>(blocks["txt_mlp.0"]);
+        auto tm2=std::dynamic_pointer_cast<Linear>(blocks["txt_mlp.2"]);
 
-        auto txt_norm1 = std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm1"]);
-        auto txt_attn  = std::dynamic_pointer_cast<SelfAttention>(blocks["txt_attn"]);
-
-        auto txt_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm2"]);
-        auto txt_mlp_0 = std::dynamic_pointer_cast<Linear>(blocks["txt_mlp.0"]);
-        auto txt_mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["txt_mlp.2"]);
-
-        ModulationOut img_mod1 = img_mods[0];
-        ModulationOut img_mod2 = img_mods[1];
-        ModulationOut txt_mod1 = txt_mods[0];
-        ModulationOut txt_mod2 = txt_mods[1];
-
-        // prepare image for attention
-        auto img_modulated = img_norm1->forward(ctx, img);
-        img_modulated      = Chroma::modulate(ctx, img_modulated, img_mod1.shift, img_mod1.scale);
-        auto img_qkv       = img_attn->pre_attention(ctx, img_modulated);
-        auto img_q         = img_qkv[0];
-        auto img_k         = img_qkv[1];
-        auto img_v         = img_qkv[2];
-
-        // prepare txt for attention
-        auto txt_modulated = txt_norm1->forward(ctx, txt);
-        txt_modulated      = Chroma::modulate(ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
-        auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated);
-        auto txt_q         = txt_qkv[0];
-        auto txt_k         = txt_qkv[1];
-        auto txt_v         = txt_qkv[2];
-
-        // run actual attention
-        auto q = ggml_concat(ctx, txt_q, img_q, 2);
-        auto k = ggml_concat(ctx, txt_k, img_k, 2);
-        auto v = ggml_concat(ctx, txt_v, img_v, 2);
-
-        auto attn = attention(ctx, q, k, v, pe, attn_mask);
-
-        int64_t N = img->ne[2];
-        int64_t L_txt = txt->ne[1];
-        int64_t L_img = img->ne[1];
-        int64_t hidden_size_attn = attn->ne[0]; // This is n_head * d_head
-
-        // Split attention output back into image and text streams
-        // attn is [N, L_txt + L_img, hidden_size_attn]
-        auto txt_attn_out = ggml_view_3d(ctx, attn, hidden_size_attn, L_txt, N, attn->nb[1], attn->nb[2], 0);
-        auto img_attn_out = ggml_view_3d(ctx, attn, hidden_size_attn, L_img, N, attn->nb[1], attn->nb[2], attn->nb[2] * L_txt);
-
-        // calculate the img blocks
-        img = ggml_add(ctx, img, ggml_mul(ctx, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate));
-
-        auto img_mlp_out = img_mlp_0->forward(ctx, Chroma::modulate(ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
-        img_mlp_out      = ggml_gelu_inplace(ctx, img_mlp_out);
-        img_mlp_out      = img_mlp_2->forward(ctx, img_mlp_out);
-
-        img = ggml_add(ctx, img, ggml_mul(ctx, img_mlp_out, img_mod2.gate));
-
-        // calculate the txt blocks
-        txt = ggml_add(ctx, txt, ggml_mul(ctx, txt_attn->post_attention(ctx, txt_attn_out), txt_mod1.gate));
-
-        auto txt_mlp_out = txt_mlp_0->forward(ctx, Chroma::modulate(ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
-        txt_mlp_out      = ggml_gelu_inplace(ctx, txt_mlp_out);
-        txt_mlp_out      = txt_mlp_2->forward(ctx, txt_mlp_out);
-
-        txt = ggml_add(ctx, txt, ggml_mul(ctx, txt_mlp_out, txt_mod2.gate));
-
-        return {img, txt};
+        struct ggml_tensor* imna=in1->forward(ctx,img);
+        imna=Chroma::modulate(ctx,imna,img_mod1.shift,img_mod1.scale);
+        auto iqkv=ia->pre_attention(ctx,imna);
+        struct ggml_tensor* tmna=tn1->forward(ctx,txt);
+        tmna=Chroma::modulate(ctx,tmna,txt_mod1.shift,txt_mod1.scale);
+        auto tqkv=ta->pre_attention(ctx,tmna);
+        auto qc=ggml_concat(ctx,tqkv[0],iqkv[0],1);
+        auto kc=ggml_concat(ctx,tqkv[1],iqkv[1],1);
+        auto vc=ggml_concat(ctx,tqkv[2],iqkv[2],1);
+        auto joa=Chroma::attention(ctx,qc,kc,vc,pe,num_heads,attn_mask);
+        int64_t Lt=txt->ne[1], Li=img->ne[1];
+        auto pjoa=ggml_cont(ctx,ggml_permute(ctx,joa,2,1,0,3));
+        auto tap=ggml_view_3d(ctx,pjoa,hidden_size,Lt,joa->ne[2],pjoa->nb[1],pjoa->nb[2],0);
+        tap=ggml_cont(ctx,ggml_permute(ctx,tap,2,1,0,3));
+        auto iap=ggml_view_3d(ctx,pjoa,hidden_size,Li,joa->ne[2],pjoa->nb[1],pjoa->nb[2],pjoa->nb[0]*Lt);
+        iap=ggml_cont(ctx,ggml_permute(ctx,iap,2,1,0,3));
+        auto ira=ia->post_attention(ctx,iap);
+        img=ggml_add(ctx,img,ggml_mul(ctx,ira,img_mod1.gate));
+        auto imn2=in2->forward(ctx,img);
+        imn2=Chroma::modulate(ctx,imn2,img_mod2.shift,img_mod2.scale);
+        auto imh=ggml_gelu_inplace(ctx,im0->forward(ctx,imn2));
+        auto imf=im2->forward(ctx,imh);
+        img=ggml_add(ctx,img,ggml_mul(ctx,imf,img_mod2.gate));
+        auto tra=ta->post_attention(ctx,tap);
+        txt=ggml_add(ctx,txt,ggml_mul(ctx,tra,txt_mod1.gate));
+        auto tmn2=tn2->forward(ctx,txt);
+        tmn2=Chroma::modulate(ctx,tmn2,txt_mod2.shift,txt_mod2.scale);
+        auto tmh=ggml_gelu_inplace(ctx,tm0->forward(ctx,tmn2));
+        auto tmf=tm2->forward(ctx,tmh);
+        txt=ggml_add(ctx,txt,ggml_mul(ctx,tmf,txt_mod2.gate));
+        return {img,txt};
     }
 };
 
-// Based on the plan (Phase 1.2 and 2.5)
 struct LastLayer_ggml : public GGMLBlock {
-    int64_t hidden_size;
-    int64_t patch_size;
-    int64_t out_channels;
-
-    LastLayer_ggml(int64_t hidden_size, int64_t patch_size, int64_t out_channels)
-        : hidden_size(hidden_size), patch_size(patch_size), out_channels(out_channels) {
-        blocks["norm_final"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-        blocks["linear"]     = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, patch_size * patch_size * out_channels));
+    int64_t hidden_size, out_channels;
+    // No internal Modulation block
+    LastLayer_ggml(int64_t hs, int64_t oc) : hidden_size(hs), out_channels(oc) {
+        blocks["norm_final"]=std::shared_ptr<GGMLBlock>(new LayerNorm(hs,1e-6f,false));
+        blocks["linear"]=std::shared_ptr<GGMLBlock>(new Linear(hs,oc,true));
     }
-
-
-
+    // shift and scale are passed directly
     struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x, struct ggml_tensor* shift, struct ggml_tensor* scale) {
-        auto norm_final = std::dynamic_pointer_cast<LayerNorm>(blocks["norm_final"]);
-        auto linear     = std::dynamic_pointer_cast<Linear>(blocks["linear"]);
-
-        // 1. Apply final normalization
-        struct ggml_tensor* x_norm = norm_final->forward(ctx, x);
-
-        // 2. Apply modulation: (1 + scale) * norm(x) + shift
-        // Reshape shift and scale for broadcasting
-        // x_norm: [N, L, hidden_size]
-        // shift, scale: [N, hidden_size]
-        struct ggml_tensor* shift_reshaped = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, shift->ne[1]); // [N, 1, hidden_size]
-        struct ggml_tensor* scale_reshaped = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]); // [N, 1, hidden_size]
-
-        struct ggml_tensor* ones_tensor = ggml_new_tensor(ctx, scale_reshaped->type, ggml_n_dims(scale_reshaped), scale_reshaped->ne);
-        ggml_set_f32(ones_tensor, 1.0f);
-        struct ggml_tensor* one_plus_scale = ggml_add(ctx, ones_tensor, scale_reshaped);
-        struct ggml_tensor* modulated_x    = ggml_mul(ctx, x_norm, one_plus_scale);
-        modulated_x                        = ggml_add(ctx, modulated_x, shift_reshaped);
-
-        // 3. Pass the modulated input through the linear layer
-        struct ggml_tensor* output = linear->forward(ctx, modulated_x);
-
-        return output;
+        auto nf=std::dynamic_pointer_cast<LayerNorm>(blocks["norm_final"]);
+        auto ln=std::dynamic_pointer_cast<Linear>(blocks["linear"]);
+        auto xn=nf->forward(ctx,x);
+        // Ensure shift/scale are [N, C] for modulate function to reshape to [N,1,C]
+        // Python: shift = shift.squeeze(1) # [N,1,C] -> [N,C]
+        // Python: scale = scale.squeeze(1)
+        // The get_modulations_for_block for "final" already returns them as [N, C]
+        auto xm=Chroma::modulate(ctx,xn,shift,scale);
+        return ln->forward(ctx,xm);
     }
 };
 
-// Based on the plan (Phase 2.1 and 2.5)
+
 struct ChromaUNet_ggml : public GGMLBlock {
-    int64_t hidden_size;
-    int64_t num_heads;
-    float mlp_ratio;
-    int64_t depth;
-    int64_t single_depth;
-    int64_t in_channels;
-    int64_t out_channels;
-    bool flash_attn;
+    ChromaParams params_unet;
 
-    ChromaUNet_ggml(int64_t hidden_size,
-                    int64_t num_heads,
-                    float mlp_ratio,
-                    int64_t depth,
-                    int64_t single_depth,
-                    int64_t in_channels,
-                    int64_t out_channels,
-                    bool flash_attn)
-        : hidden_size(hidden_size), num_heads(num_heads), mlp_ratio(mlp_ratio),
-          depth(depth), single_depth(single_depth), in_channels(in_channels),
-          out_channels(out_channels), flash_attn(flash_attn) {
-        blocks["distilled_guidance_layer"] = std::shared_ptr<GGMLBlock>(new Approximator_ggml(64, hidden_size * 6 , hidden_size)); // out_dim is hidden_size * 6 for 2 sets of scale/shift/gate
-
-        blocks["img_in"] = std::shared_ptr<GGMLBlock>(new Linear(in_channels, hidden_size, true));
-        blocks["txt_in"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size, true)); // T5 embeddings are already hidden_size
-
-        for (int i = 0; i < depth; ++i) {
-            blocks["double_blocks." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new DoubleStreamBlock_ggml(hidden_size, num_heads, mlp_ratio, true, flash_attn));
+    ChromaUNet_ggml(const ChromaParams& params_arg) {
+        this->params_unet = params_arg; // Store a copy
+        if (this->params_unet.num_heads > 0 && this->params_unet.unet_model_dim > 0 && this->params_unet.unet_model_dim % this->params_unet.num_heads == 0) {
+             this->params_unet.head_dim = this->params_unet.unet_model_dim / this->params_unet.num_heads;
+        } else {
+            // Handle error or set default, though ChromaParams constructor should do this
+            this->params_unet.head_dim = 128; 
         }
 
-        for (int i = 0; i < single_depth; ++i) {
-            blocks["single_blocks." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new SingleStreamBlock_ggml(hidden_size, num_heads, mlp_ratio, 0.f));
-        }
 
-        blocks["final_layer"] = std::shared_ptr<GGMLBlock>(new LastLayer_ggml(hidden_size, 1, out_channels)); // patch_size is 1 for Chroma
+        blocks["distilled_guidance_layer"] = std::shared_ptr<GGMLBlock>(
+            new Approximator_ggml(params_unet.approximator_input_concat_dim, // Calculated input dim
+                                  params_unet.approximator_feature_dim,    // Output feature dim per index
+                                  params_unet.approximator_internal_hidden_dim));
+
+        // img_in takes raw VAE latent channels (e.g., 4 or 64 if already projected by VAE encoder)
+        // The GGUF has img_in.weight: [64 3072], so input is 64 channels, output 3072 model_dim
+        blocks["img_in"] = std::shared_ptr<GGMLBlock>(new Linear(params_unet.in_channels, params_unet.unet_model_dim, true));
+        blocks["txt_in"] = std::shared_ptr<GGMLBlock>(new Linear(params_unet.t5_embed_dim, params_unet.unet_model_dim, true));
+
+        for (int i = 0; i < params_unet.depth; ++i) {
+            blocks["double_blocks." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(
+                new DoubleStreamBlock_ggml(params_unet.unet_model_dim, params_unet.num_heads, params_unet.mlp_ratio,
+                                           true)); // Removed vec_dim
+        }
+        for (int i = 0; i < params_unet.depth_single_blocks; ++i) {
+            blocks["single_blocks." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(
+                new SingleStreamBlock_ggml(params_unet.unet_model_dim, params_unet.num_heads, params_unet.mlp_ratio)); // Removed vec_dim
+        }
+        
+        // NO "final_layer_mod" block, as LastLayer gets its s/s from get_modulations_for_block
+
+        blocks["final_layer"] = std::shared_ptr<GGMLBlock>(
+            new LastLayer_ggml(params_unet.unet_model_dim, params_unet.out_channels));
     }
 
-
+    // img_latent_tokens: [N, L_img, C_in_channels] (before img_in projection)
+    // timestep_for_approximator_input_vec: [N, L_indices_for_approximator, C_concat_for_approximator_input] (this is the 'input_vec' from Python)
+    // txt_embeddings: [N, L_txt, C_t5_embed_dim] (before txt_in projection)
+    // TODO: Add pe, t5_padding_mask generation and input preparation
     struct ggml_tensor* forward(struct ggml_context* ctx,
-                                struct ggml_tensor* img_latent,
-                                struct ggml_tensor* timestep,
+                                struct ggml_tensor* img_latent_tokens,
+                                struct ggml_tensor* timestep_for_approximator_input_vec,
                                 struct ggml_tensor* txt_embeddings,
                                 struct ggml_tensor* pe,
                                 struct ggml_tensor* t5_padding_mask,
-                                std::vector<int> skip_layers = std::vector<int>()) {
+                                std::vector<int> skip_layers = {}) {
         auto approximator = std::dynamic_pointer_cast<Approximator_ggml>(blocks["distilled_guidance_layer"]);
-        auto img_in       = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
-        auto txt_in       = std::dynamic_pointer_cast<Linear>(blocks["txt_in"]);
-        auto final_layer  = std::dynamic_pointer_cast<LastLayer_ggml>(blocks["final_layer"]);
+        auto img_in_proj = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
+        auto txt_in_proj = std::dynamic_pointer_cast<Linear>(blocks["txt_in"]);
+        auto final_layer = std::dynamic_pointer_cast<LastLayer_ggml>(blocks["final_layer"]);
 
-        // 1. Process timestep through Approximator to get modulation signals
-        struct ggml_tensor* approx_output = approximator->forward(ctx, timestep); // [N, hidden_size * 6]
+        // This is mod_vectors from Python: [N, mod_vector_total_indices, approximator_feature_dim]
+        struct ggml_tensor* mod_vectors_global = approximator->forward(ctx, timestep_for_approximator_input_vec);
 
-        // Initialize image and text inputs
-        img_latent = img_in->forward(ctx, img_latent);
-        txt_embeddings = txt_in->forward(ctx, txt_embeddings);
+        struct ggml_tensor* current_img_tokens = img_in_proj->forward(ctx, img_latent_tokens);
+        struct ggml_tensor* current_txt_tokens = txt_in_proj->forward(ctx, txt_embeddings);
 
-        // DoubleStreamBlocks
-        for (int i = 0; i < depth; ++i) {
-            if (std::find(skip_layers.begin(), skip_layers.end(), i) != skip_layers.end()) {
-                continue;
-            }
-            auto block = std::dynamic_pointer_cast<DoubleStreamBlock_ggml>(blocks["double_blocks." + std::to_string(i)]);
+        for (int i = 0; i < params_unet.depth; ++i) {
+            // ... skip_layers check ...
+            auto block = std::dynamic_pointer_cast<DoubleStreamBlock_ggml>(blocks["double_blocks."+std::to_string(i)]);
+            BlockModulationOutput img_mods_output = get_modulations_for_block(ctx, params_unet, mod_vectors_global, "double_img", i);
+            BlockModulationOutput txt_mods_output = get_modulations_for_block(ctx, params_unet, mod_vectors_global, "double_txt", i);
+            
+            // Assuming the type is DOUBLE for these blocks
+            auto& img_mods_pair = img_mods_output.double_mods;
+            auto& txt_mods_pair = txt_mods_output.double_mods;
 
-            // Need to create ModulationOut vectors for img and txt
-            // This implies the approx_output needs to be split into 4 sets of (scale, shift, gate)
-            // Or the Modulation class needs to be called multiple times.
-
-            // Let's create two Modulation instances here, one for img and one for txt.
-            // And pass the relevant part of approx_output to them.
-            // This means approx_output needs to be split into two halves.
-
-            int64_t N = img_latent->ne[2]; // Batch size
-
-            struct ggml_tensor* approx_img_vec = ggml_view_2d(ctx, approx_output, hidden_size * 6, N, approx_output->nb[1], 0);
-            struct ggml_tensor* approx_txt_vec = ggml_view_2d(ctx, approx_output, hidden_size * 6, N, approx_output->nb[1], approx_output->nb[1] * hidden_size * 6);
-
-            Modulation img_mod_block(hidden_size, true);
-            Modulation txt_mod_block(hidden_size, true);
-
-            std::vector<ModulationOut> img_mods = img_mod_block.forward(ctx, approx_img_vec);
-            std::vector<ModulationOut> txt_mods = txt_mod_block.forward(ctx, approx_txt_vec);
-
-            auto img_txt = block->forward(ctx, img_latent, txt_embeddings, pe, img_mods, txt_mods, t5_padding_mask);
-            img_latent   = img_txt.first;
-            txt_embeddings = img_txt.second;
+            auto pair_tokens = block->forward(ctx, current_img_tokens, current_txt_tokens, pe, img_mods_pair, txt_mods_pair, t5_padding_mask);
+            current_img_tokens = pair_tokens.first;
+            current_txt_tokens = pair_tokens.second;
         }
 
-        // Concatenate image and text tokens for SingleStreamBlocks
-        // The plan says: `auto txt_img = ggml_concat(ctx, txt, img, 1);`
-        // This means txt_embeddings and img_latent are concatenated.
-        struct ggml_tensor* combined_tokens = ggml_concat(ctx, txt_embeddings, img_latent, 1);
+        struct ggml_tensor* combined_tokens = ggml_concat(ctx, current_txt_tokens, current_img_tokens, 1);
 
-        // SingleStreamBlocks
-        for (int i = 0; i < single_depth; ++i) {
-            if (std::find(skip_layers.begin(), skip_layers.end(), i + depth) != skip_layers.end()) {
-                continue;
-            }
-            auto block = std::dynamic_pointer_cast<SingleStreamBlock_ggml>(blocks["single_blocks." + std::to_string(i)]);
-
-            // SingleStreamBlock takes one ModulationOut.
-            // This means approx_output needs to be split into one set of (scale, shift, gate).
-            // This is inconsistent with the DoubleStreamBlock.
-
-            // Re-reading the plan:
-            // Approximator output: `conditioning signal (Tensor of shape [batch_size, 1, out_dim])`, likely split into scale, shift, gate.
-            // SingleStreamBlock: `mod = vec`
-            // DoubleStreamBlock: `(img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec`
-
-            // This implies `vec` is a complex structure.
-            // Let's assume `approx_output` is the `vec` and it contains all necessary modulation parameters.
-            // And the `Modulation` class will be used to extract them.
-
-            // Let's assume `approx_output` is `hidden_size * 6` (for 2 sets of modulations).
-            // And `SingleStreamBlock` will use the first set.
-
-            Modulation single_mod_block(hidden_size, false);
-            std::vector<ModulationOut> single_mods = single_mod_block.forward(ctx, approx_output);
-            ModulationOut single_mod = single_mods[0];
-
+        for (int i = 0; i < params_unet.depth_single_blocks; ++i) {
+            // ... skip_layers check ...
+            auto block = std::dynamic_pointer_cast<SingleStreamBlock_ggml>(blocks["single_blocks."+std::to_string(i)]);
+            BlockModulationOutput single_mod_output = get_modulations_for_block(ctx, params_unet, mod_vectors_global, "single", i);
+            
+            // Assuming the type is SINGLE for these blocks
+            auto& single_mod = single_mod_output.single_mod;
             combined_tokens = block->forward(ctx, combined_tokens, pe, single_mod, t5_padding_mask);
         }
+        
+        // Extract relevant part for final layer (output of SingleStreamBlocks corresponding to image tokens)
+        // This assumes txt tokens are first in combined_tokens
+        int64_t num_txt_tokens = current_txt_tokens->ne[1]; // Or get from input txt_embeddings
+        struct ggml_tensor* final_img_tokens = ggml_view_3d(ctx, combined_tokens,
+            combined_tokens->ne[0], // hidden_size
+            combined_tokens->ne[1] - num_txt_tokens, // L_img
+            combined_tokens->ne[2], // N
+            combined_tokens->nb[1], // stride L
+            combined_tokens->nb[2], // stride N
+            num_txt_tokens * combined_tokens->nb[1] // offset by L_txt * stride L
+        );
 
-        // Final Layer
-        // The plan says: `LastLayer(nn.Module)` takes `x: Tensor, vec: Tensor`.
-        // `shift, scale = vec`.
-        // So, `final_layer` needs `shift` and `scale`.
-        // This means `approx_output` needs to contain `shift` and `scale` for the final layer.
 
-        // Let's assume `approx_output` contains `shift` and `scale` for the final layer.
-        // And we extract them.
-
-        // This is inconsistent. The `Approximator` output is `out_dim`.
-        // And `out_dim` is `hidden_size * 6`.
-        // This means `approx_output` contains 2 sets of (scale, shift, gate).
-        // But `LastLayer` needs only `shift` and `scale`.
-
-        // Let's assume the `approx_output` is directly used as `vec` for `LastLayer`.
-        // And `LastLayer` will extract `shift` and `scale` from it.
-        // This means `approx_output` should contain `hidden_size * 2` for `LastLayer`.
-
-        // Let's simplify the `Approximator` output to be just `hidden_size`.
-        // And then we will use `Modulation` blocks to generate the actual modulation parameters.
-        // This is how Flux does it.
-
-        // Let's revert `Approximator_ggml` `out_dim` to `hidden_size`.
-        // And then create `Modulation` blocks in `ChromaUNet_ggml`.
-
-        // Reverting `Approximator_ggml` `out_dim` to `hidden_size`.
-        // And then creating `Modulation` blocks in `ChromaUNet_ggml`.
-
-        // This means `ChromaUNet_ggml` needs to have `Modulation` blocks as members.
-        // And `Approximator` output is just a `vec` that is passed to these `Modulation` blocks.
-
-        // Let's assume `approx_output` is the `vec` for all modulation.
-        // And `Modulation` class will be used to extract them.
-
-        // Let's assume `approx_output` is `hidden_size * 6` (for 2 sets of modulations).
-        // And `LastLayer` will use the first set of `shift` and `scale`.
-
-        // Extract shift and scale for LastLayer from approx_output
-        int64_t N = img_latent->ne[2]; // Batch size
-        struct ggml_tensor* final_shift = ggml_view_2d(ctx, approx_output, hidden_size, N, approx_output->nb[1], 0);
-        struct ggml_tensor* final_scale = ggml_view_2d(ctx, approx_output, hidden_size, N, approx_output->nb[1], approx_output->nb[1] * hidden_size);
-
-        img_latent = final_layer->forward(ctx, combined_tokens, final_shift, final_scale);
-
-        return img_latent;
+        BlockModulationOutput final_mod_output = get_modulations_for_block(ctx, params_unet, mod_vectors_global, "final", 0);
+        // Assuming the type is FINAL for the final layer
+        auto& final_mod_pair = final_mod_output.final_mods;
+        // Python uses vec=(shift,scale), so order is shift, scale for LastLayer.forward()
+        struct ggml_tensor* output_tokens = final_layer->forward(ctx, final_img_tokens, final_mod_pair.first, final_mod_pair.second);
+        
+        return output_tokens;
     }
 };
 
-// Struct to hold Chroma model configuration parameters
-struct ChromaParams {
-    int32_t in_channels = 64;
-    int32_t out_channels = 64;
-    int32_t vec_in_dim = 768; // Not directly used by ChromaUNet, but kept for consistency with Flux
-    int32_t hidden_size = 5120;
-    float mlp_ratio = 4.0f;
-    int32_t num_heads = 24;
-    int32_t depth = 19;
-    int32_t single_depth = 38;
-    bool flash_attn; // This will be set by the constructor
-};
-
-// ChromaRunner struct, inheriting from GGMLRunner
 struct ChromaRunner : public GGMLRunner {
-    ChromaParams chroma_params;
+    ChromaParams chroma_hyperparams; // Store the configured hyperparameters
     ChromaUNet_ggml chroma_unet;
 
     ChromaRunner(
         ggml_backend_t backend,
         std::map<std::string, enum ggml_type>& tensor_types,
-        const std::string prefix                            = "",
-        bool flash_attn = false
+        const std::string prefix =  "",
+        bool use_flash_attn = false
     ) :
         GGMLRunner(backend),
-        chroma_params({
-            .flash_attn = flash_attn
-        }),
-        chroma_unet(
-            chroma_params.hidden_size, chroma_params.num_heads, chroma_params.mlp_ratio,
-            chroma_params.depth, chroma_params.single_depth,
-            chroma_params.in_channels, chroma_params.out_channels, chroma_params.flash_attn
-        )
+        chroma_hyperparams({}),
+        chroma_unet(chroma_hyperparams)         // Initialize UNet with these params
     {
-        chroma_unet.init(params_ctx, tensor_types,prefix);
+        chroma_unet.init(params_ctx, tensor_types, prefix);
     }
 
     std::string get_desc() override {
         return "chroma";
     }
 
-    void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors, const std::string prefix) { // Removed override
+    void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors, const std::string prefix)  {
         chroma_unet.get_param_tensors(tensors, prefix);
     }
 
+    // Assuming img_latent_tokens, timestep_for_approximator_input_vec, txt_tokens are prepared outside
     struct ggml_cgraph* build_graph(
-        struct ggml_tensor* x,
-        struct ggml_tensor* timesteps,
-        struct ggml_tensor* context,
-        struct ggml_tensor* t5_padding_mask,
-        struct ggml_tensor* pe,
-        std::vector<int> skip_layers
+        struct ggml_tensor* img_latent_tokens, // [N, L_img, C_img_in_to_unet]
+        struct ggml_tensor* timestep_for_approximator_input_vec,    // [N, L_indices_for_approximator, C_concat_for_approximator_input]
+        struct ggml_tensor* txt_tokens,      // [N, L_txt, C_txt_in_to_unet] (after T5 + projection)
+        struct ggml_tensor* pe,                // Positional embeddings
+        struct ggml_tensor* t5_padding_mask,   // Attention mask
+        std::vector<int> skip_layers = {}
     ) {
         struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, CHROMA_GRAPH_SIZE, false);
 
-        x = to_backend(x);
-        timesteps = to_backend(timesteps);
-        context = to_backend(context);
-        t5_padding_mask = to_backend(t5_padding_mask);
-        pe = to_backend(pe);
+        img_latent_tokens = to_backend(img_latent_tokens);
+        timestep_for_approximator_input_vec    = to_backend(timestep_for_approximator_input_vec);
+        txt_tokens        = to_backend(txt_tokens);
+        pe                = to_backend(pe);
+        if (t5_padding_mask) t5_padding_mask = to_backend(t5_padding_mask);
 
         struct ggml_tensor* output = chroma_unet.forward(
-            compute_ctx, x, timesteps, context, pe, t5_padding_mask, skip_layers
+            compute_ctx, img_latent_tokens, timestep_for_approximator_input_vec, txt_tokens, pe, t5_padding_mask, skip_layers
         );
 
         ggml_build_forward_expand(gf, output);
-
         return gf;
     }
 
     void compute(
         int n_threads,
-        struct ggml_tensor* x,
-        struct ggml_tensor* timesteps,
-        struct ggml_tensor* context,
-        struct ggml_tensor* t5_padding_mask,
+        struct ggml_tensor* img_latent_tokens,
+        struct ggml_tensor* timestep_for_approximator_input_vec,
+        struct ggml_tensor* txt_tokens,
         struct ggml_tensor* pe,
+        struct ggml_tensor* t5_padding_mask,
         struct ggml_tensor** output = NULL,
         struct ggml_context* output_ctx = NULL,
-        std::vector<int> skip_layers = std::vector<int>()
+        std::vector<int> skip_layers = {}
     ) {
-        auto get_graph = [&]() -> struct ggml_cgraph* {
-            return build_graph(x, timesteps, context, t5_padding_mask, pe, skip_layers);
+        auto get_graph_fn = [&]() -> struct ggml_cgraph* { // Renamed lambda variable
+            return build_graph(img_latent_tokens, timestep_for_approximator_input_vec, txt_tokens, pe, t5_padding_mask, skip_layers);
         };
-
-        GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        GGMLRunner::compute(get_graph_fn, n_threads, false, output, output_ctx); // Use renamed lambda
     }
 };
+
 
 } // namespace Chroma
 #endif // __CHROMA_HPP__

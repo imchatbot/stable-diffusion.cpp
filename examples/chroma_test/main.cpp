@@ -35,12 +35,12 @@ int main() {
     std::cout << "\n--- VAE and T5 Model Testing via Stable Diffusion API ---" << std::endl;
 
     // Define model paths
-    const char* model_path = "weights/chroma-unlocked-v29.5-Q3_K_L.gguf"; // Main model path (can be empty if only VAE/T5 are loaded)
+    const char* model_path = ""; // Main model path (can be empty if only VAE/T5 are loaded)
     const char* clip_l_path = "";
     const char* clip_g_path = "";
-    const char* t5xxl_path = "weights/t5xxl_q3_k.gguf"; // New T5 model path
-    const char* diffusion_model_path = "";
-    const char* vae_path = "weights/ae.safetensors"; // Example VAE path (can be GGUF or safetensors)
+    const char* t5xxl_path = "./weights/t5xxl_q3_k.gguf"; // New T5 model path
+    const char* diffusion_model_path = "./weights/chroma-unlocked-v29.5-Q3_K_L.gguf";
+    const char* vae_path = "./weights/ae.safetensors"; // Example VAE path (can be GGUF or safetensors)
     const char* control_net_path = "";
     const char* lora_model_dir = "";
     const char* embed_dir = "";
