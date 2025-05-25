@@ -902,7 +902,6 @@ struct SD3CLIPEmbedder : public Conditioner {
 
                 t5->compute(n_threads,
                             input_ids,
-                            NULL, // Pass NULL for attention_mask_01
                             &chunk_hidden_states_t5,
                             work_ctx);
                 {
@@ -1148,7 +1147,6 @@ struct FluxCLIPEmbedder : public Conditioner {
 
                 t5->compute(n_threads,
                             input_ids,
-                            NULL, // Pass NULL for attention_mask_01
                             &chunk_hidden_states,
                             work_ctx);
                 {
@@ -1237,7 +1235,7 @@ struct ChromaT5Embedder : public Conditioner {
                                       int width,     // Not used by T5
                                       int height,    // Not used by T5
                                       int adm_in_channels        = -1, // Not used by T5
-                                      bool force_zero_embeddings = false) override {
+                                      bool force_zero_embeddings = false)  {
         // Tokenize the text using T5UniGramTokenizer
         auto parsed_attention = parse_prompt_attention(text);
         std::vector<int> tokens;
@@ -1261,18 +1259,8 @@ struct ChromaT5Embedder : public Conditioner {
         struct ggml_tensor* input_ids = vector_to_ggml_tensor_i32(work_ctx, tokens);
         struct ggml_tensor* hidden_states = NULL;
 
-        // Generate T5 padding mask (c_concat)
-        struct ggml_tensor* c_concat_tensor = NULL;
-        std::vector<float> padding_mask_vec(tokens.size());
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            padding_mask_vec[i] = (tokens[i] == t5_tokenizer.pad_id_) ? 0.0f : 1.0f;
-        }
-        c_concat_tensor = vector_to_ggml_tensor(work_ctx, padding_mask_vec);
-        c_concat_tensor = ggml_reshape_2d(work_ctx, c_concat_tensor, 1, tokens.size()); // Reshape to [1, N_tokens]
-
-
-        // Compute T5 embeddings, passing the attention mask
-        t5->compute(n_threads, input_ids, c_concat_tensor, &hidden_states, work_ctx);
+        // Compute T5 embeddings
+        t5->compute(n_threads, input_ids, &hidden_states, work_ctx);
 
         // Apply weights to hidden_states, similar to FluxCLIPEmbedder
         if (!force_zero_embeddings) {
@@ -1294,6 +1282,15 @@ struct ChromaT5Embedder : public Conditioner {
                 vec[i] = 0;
             }
         }
+
+        // Generate T5 padding mask (c_concat)
+        struct ggml_tensor* c_concat_tensor = NULL;
+        std::vector<float> padding_mask_vec(tokens.size());
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            padding_mask_vec[i] = (tokens[i] == 0) ? 0.0f : 1.0f;
+        }
+        c_concat_tensor = vector_to_ggml_tensor(work_ctx, padding_mask_vec);
+        c_concat_tensor = ggml_reshape_2d(work_ctx, c_concat_tensor, 1, tokens.size()); // Reshape to [1, N_tokens]
 
         return SDCondition(hidden_states, NULL, c_concat_tensor);
     }
