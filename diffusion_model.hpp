@@ -5,6 +5,7 @@
 #include "mmdit.hpp"
 #include "unet.hpp"
 #include "chroma.hpp"
+#include "ggml_extend.hpp" // Required for set_timestep_embedding
 
 struct DiffusionModel {
     virtual void compute(int n_threads,
@@ -216,100 +217,79 @@ struct ChromaModel : public DiffusionModel {
     }
 
     void compute(int n_threads,
-                 struct ggml_tensor* x,
-                 struct ggml_tensor* timesteps,
-                 struct ggml_tensor* context, // T5 embeddings
-                 struct ggml_tensor* c_concat, // Not used by Chroma
-                 struct ggml_tensor* y, // Not used by Chroma
-                 struct ggml_tensor* guidance, // Not used by Chroma
-                 int num_video_frames                      = -1, // Not used by Chroma
-                 std::vector<struct ggml_tensor*> controls = {}, // Not used by Chroma
-                 float control_strength                    = 0.f, // Not used by Chroma
+                 struct ggml_tensor* x, // img_latent_tokens
+                 struct ggml_tensor* timesteps, // raw_timesteps
+                 struct ggml_tensor* context, // txt_embeddings (T5 embeddings)
+                 struct ggml_tensor* c_concat, // t5_padding_mask
+                 struct ggml_tensor* y, // pe (positional embeddings)
+                 struct ggml_tensor* guidance, // raw_guidance
+                 int num_video_frames                      = -1,
+                 std::vector<struct ggml_tensor*> controls = {},
+                 float control_strength                    = 0.f,
                  struct ggml_tensor** output               = NULL,
                  struct ggml_context* output_ctx           = NULL,
                  std::vector<int> skip_layers              = std::vector<int>()) {
-        // For Chroma, context is T5 embeddings, c_concat and y are not used.
-        // We need to pass positional embeddings (pe) and t5_padding_mask.
-        // These are not directly available in the DiffusionModel compute signature.
-        // This implies a need to adjust the DiffusionModel interface or how ChromaModel is called.
+        // ... existing comments about repurposing inputs ...
 
-        // For now, let's assume pe and t5_padding_mask are handled internally by ChromaRunner
-        // or passed through a different mechanism.
-        // Based on the ChromaRunner::build_graph, it expects t5_padding_mask and pe.
-        // The current DiffusionModel interface does not provide these.
+        // Construct timestep_for_approximator_input_vec as per Python logic
+        int64_t batch_size = x->ne[3]; // Assuming batch size is the last dim of x (img_latent_tokens)
 
-        // This is a design conflict. The current DiffusionModel interface is generic.
-        // Chroma has specific inputs (T5 embeddings, T5 padding mask, positional embeddings).
-        // FluxModel also has specific inputs (pe, guidance).
+        // 1. distill_timestep = timestep_embedding(timesteps, 16)
+        // raw_timesteps is expected to be a 1D tensor [N] or [1]. Extract the single float value.
+        std::vector<float> current_timestep_val = {ggml_get_f32_1d(timesteps, 0)};
+        struct ggml_tensor* distill_timestep_tensor = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, 16, batch_size);
+        set_timestep_embedding(current_timestep_val, distill_timestep_tensor, 16);
+        // Permute from [16, batch_size] to [batch_size, 16] to match Python's (batch_size, 16)
+        distill_timestep_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, distill_timestep_tensor, 1, 0, 2, 3));
 
-        // Let's re-evaluate the `compute` method signature for `DiffusionModel`.
-        // The `compute` method in `DiffusionModel` is quite generic.
-        // `FluxModel` uses `pe` and `guidance`.
-        // `ChromaModel` needs `pe` and `t5_padding_mask`.
+        // 2. distil_guidance = timestep_embedding(guidance, 16)
+        std::vector<float> current_guidance_val = {ggml_get_f32_1d(guidance, 0)};
+        struct ggml_tensor* distil_guidance_tensor = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, 16, batch_size);
+        set_timestep_embedding(current_guidance_val, distil_guidance_tensor, 16);
+        // Permute from [16, batch_size] to [batch_size, 16]
+        distil_guidance_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, distil_guidance_tensor, 1, 0, 2, 3));
 
-        // The `stable-diffusion.cpp` calls `diffusion_model->compute`.
-        // It passes `context`, `c_concat`, `y`, `guidance`.
+        // 3. modulation_index = timestep_embedding(torch.arange(mod_index_length), 32)
+        // mod_index_length is chroma.chroma_hyperparams.mod_vector_total_indices (344)
+        std::vector<float> arange_mod_index(chroma.chroma_hyperparams.mod_vector_total_indices);
+        for (int i = 0; i < chroma.chroma_hyperparams.mod_vector_total_indices; ++i) {
+            arange_mod_index[i] = (float)i;
+        }
+        struct ggml_tensor* modulation_index_tensor = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, 32, chroma.chroma_hyperparams.mod_vector_total_indices);
+        set_timestep_embedding(arange_mod_index, modulation_index_tensor, 32);
+        // Permute from [32, mod_index_length] to [mod_index_length, 32] to match Python's (mod_index_length, 32)
+        modulation_index_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, modulation_index_tensor, 1, 0, 2, 3));
 
-        // For Chroma, `context` is `txt_embeddings`.
-        // `c_concat` and `y` are not directly used by Chroma's UNet.
-        // `guidance` is also not directly used by Chroma's UNet.
+        // 4. Broadcast modulation_index: unsqueeze(0).repeat(batch_size, 1, 1)
+        // From [mod_index_length, 32] to [batch_size, mod_index_length, 32]
+        // Reshape to [32, mod_index_length, 1] then repeat along batch dimension
+        modulation_index_tensor = ggml_reshape_3d(output_ctx, modulation_index_tensor, 32, chroma.chroma_hyperparams.mod_vector_total_indices, 1);
+        modulation_index_tensor = ggml_repeat(output_ctx, modulation_index_tensor, ggml_new_tensor_3d(output_ctx, GGML_TYPE_F32, 32, chroma.chroma_hyperparams.mod_vector_total_indices, batch_size));
+        // Permute back to [batch_size, mod_index_length, 32]
+        modulation_index_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, modulation_index_tensor, 2, 1, 0, 3));
 
-        // The `chroma_integration_plan.md` states:
-        // `Pass the image latent, the T5 embeddings sequence, the timestep, positional embeddings, and the T5 padding mask to the ChromaUNet_ggml forward function.`
+        // 5. Concatenate distill_timestep and distil_guidance: torch.cat([distill_timestep, distil_guidance], dim=1)
+        // From [batch_size, 16] and [batch_size, 16] to [batch_size, 32]
+        struct ggml_tensor* combined_timestep_guidance = ggml_concat(output_ctx, distill_timestep_tensor, distil_guidance_tensor, 1);
 
-        // This means the `ChromaModel::compute` needs to receive `pe` and `t5_padding_mask`.
-        // The current `DiffusionModel::compute` signature does not have these.
+        // 6. Broadcast combined_timestep_guidance: unsqueeze(1).repeat(1, mod_index_length, 1)
+        // From [batch_size, 32] to [batch_size, mod_index_length, 32]
+        // Reshape to [32, 1, batch_size] then repeat along mod_index_length dimension
+        combined_timestep_guidance = ggml_reshape_3d(output_ctx, combined_timestep_guidance, 32, 1, batch_size);
+        combined_timestep_guidance = ggml_repeat(output_ctx, combined_timestep_guidance, ggml_new_tensor_3d(output_ctx, GGML_TYPE_F32, 32, chroma.chroma_hyperparams.mod_vector_total_indices, batch_size));
+        // Permute back to [batch_size, mod_index_length, 32]
+        combined_timestep_guidance = ggml_cont(output_ctx, ggml_permute(output_ctx, combined_timestep_guidance, 2, 1, 0, 3));
 
-        // I need to modify the `DiffusionModel` interface to include `pe` and `t5_padding_mask`.
-        // This will affect all other DiffusionModel implementations (UNetModel, MMDiTModel, FluxModel).
-        // This is a larger change than just implementing ChromaModel.
-
-        // Let's check the objective again: "Implement the `ChromaModel` class and integrate it into `StableDiffusionGGML`".
-        // It doesn't explicitly say to modify the `DiffusionModel` interface.
-
-        // Alternative: `ChromaRunner` could generate `pe` and `t5_padding_mask` internally.
-        // `pe` generation depends on image dimensions and context length.
-        // `t5_padding_mask` generation depends on T5 token IDs.
-
-        // The `FluxRunner::build_graph` generates `pe_vec` and then creates `pe` tensor.
-        // So, `pe` can be generated inside `ChromaRunner`.
-
-        // For `t5_padding_mask`, it needs `token_ids` which come from `T5Embedder`.
-        // `T5Embedder` is part of `cond_stage_model`.
-        // The `cond_stage_model->get_learned_condition` returns `SDCondition` which contains `c_crossattn` (T5 embeddings).
-        // It does not return `token_ids`.
-
-        // This means `t5_padding_mask` cannot be generated inside `ChromaRunner` without access to `token_ids`.
-        // The `generate_t5_padding_mask_ggml` function needs `token_ids`.
-
-        // This implies that `token_ids` (or the `t5_padding_mask` itself) needs to be passed to `ChromaModel::compute`.
-        // This means the `DiffusionModel::compute` interface *must* change.
-
-        // Let's assume for now that `t5_padding_mask` and `pe` are passed as part of `context` or `c_concat` or `y`
-        // or that the `ChromaRunner` can somehow access them.
-        // This is a hacky solution.
-
-        // Let's look at `stable-diffusion.cpp` where `diffusion_model->compute` is called.
-        // It passes `x`, `timesteps`, `cond.c_crossattn`, `cond.c_concat`, `cond.c_vector`, `guidance_tensor`.
-        // For Chroma, `cond.c_crossattn` is `txt_embeddings`.
-        // `cond.c_concat` and `cond.c_vector` are currently unused for Chroma.
-        // I can repurpose `cond.c_concat` for `t5_padding_mask` and `cond.c_vector` for `pe`.
-        // This is a bit of a hack, but avoids changing the `DiffusionModel` interface for now.
-
-        // Let's assume:
-        // `context` (original `c_crossattn`) is `txt_embeddings`
-        // `c_concat` is `t5_padding_mask`
-        // `y` is `pe`
-
-        // This means I need to modify `stable-diffusion.cpp` to pass these correctly.
-        // And `ChromaModel::compute` will interpret them as such.
+        // 7. Final concatenation for input_vec: torch.cat([timestep_guidance, modulation_index], dim=-1)
+        // From [batch_size, mod_index_length, 32] and [batch_size, mod_index_length, 32] to [batch_size, mod_index_length, 64]
+        struct ggml_tensor* constructed_timestep_for_approximator_input_vec = ggml_concat(output_ctx, combined_timestep_guidance, modulation_index_tensor, 2);
 
         chroma.compute(n_threads,
-                       x,
-                       timesteps,
-                       context, // T5 embeddings
+                       x, // img_latent_tokens
+                       constructed_timestep_for_approximator_input_vec, // constructed input_vec
+                       context, // txt_tokens (T5 embeddings)
+                       y, // pe (positional embeddings)
                        c_concat, // t5_padding_mask
-                       y, // pe
                        output,
                        output_ctx,
                        skip_layers);
