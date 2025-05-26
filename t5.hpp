@@ -278,7 +278,7 @@ protected:
             bool has_single_node = false;
             const int mblen =
                 std::min<int>(OneCharLen(normalized.data() + starts_at),
-                              size - starts_at);
+                                size - starts_at);
             while (key_pos < size) {
                 const int ret =
                     trie_->traverse(normalized.data(), node_pos, key_pos, key_pos + 1);
@@ -688,11 +688,14 @@ public:
 
 struct T5 : public GGMLBlock {
 public:
+    int64_t model_dim; // Add model_dim as a member
+
     T5(int64_t num_layers,
        int64_t model_dim,
        int64_t ff_dim,
        int64_t num_heads,
-       int64_t vocab_size) {
+       int64_t vocab_size) : model_dim(model_dim) // Initialize model_dim
+    {
         blocks["encoder"] = std::shared_ptr<GGMLBlock>(new T5Stack(num_layers, model_dim, model_dim, ff_dim, num_heads));
         blocks["shared"]  = std::shared_ptr<GGMLBlock>(new Embedding(vocab_size, model_dim));
     }
