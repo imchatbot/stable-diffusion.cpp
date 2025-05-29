@@ -280,6 +280,11 @@ arguments:
 # ./bin/sd -m ../models/sd3_medium_incl_clips_t5xxlfp16.safetensors -H 1024 -W 1024 -p 'a lovely cat holding a sign says \"Stable Diffusion CPP\"' --cfg-scale 4.5 --sampling-method euler -v
 # ./bin/sd --diffusion-model  ../models/flux1-dev-q3_k.gguf --vae ../models/ae.sft --clip_l ../models/clip_l.safetensors --t5xxl ../models/t5xxl_fp16.safetensors  -p "a lovely cat holding a sign says 'flux.cpp'" --cfg-scale 1.0 --sampling-method euler -v
 # ./bin/sd -m  ..\models\sd3.5_large.safetensors --clip_l ..\models\clip_l.safetensors --clip_g ..\models\clip_g.safetensors --t5xxl ..\models\t5xxl_fp16.safetensors  -H 1024 -W 1024 -p 'a lovely cat holding a sign says \"Stable diffusion 3.5 Large\"' --cfg-scale 4.5 --sampling-method euler -v
+
+
+./bin/sd --diffusion-model  /root/models/unet/Chroma/chroma-unlocked-v32.safetensors --vae /root/models/vae/Chroma/ae.sft  --t5xxl /root/models/text_encoders/Chroma/t5xxl_fp16.safetensors  -p "a lovely cat holding a sign says 'flux.cpp'" --cfg-scale 1.0 --sampling-method euler -v
+
+./bin/sd --diffusion-model  /root/models/unet/flux1-schnell-F16.gguf --vae /root/models/vae/Chroma/ae.sft  --t5xxl /root/models/text_encoders/Chroma/t5xxl_fp16.safetensors  --clip_l /root/models/text_encoders/clip_l.safetensors   -p "a lovely cat holding a sign says 'flux.cpp'" --cfg-scale 1.0 --sampling-method euler -v
 ```
 
 Using formats of different precisions will yield results of varying quality.

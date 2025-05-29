@@ -229,70 +229,51 @@ struct ChromaModel : public DiffusionModel {
                  struct ggml_tensor** output               = NULL,
                  struct ggml_context* output_ctx           = NULL,
                  std::vector<int> skip_layers              = std::vector<int>()) {
-        // ... existing comments about repurposing inputs ...
+        LOG_DEBUG(" Start compute chroma");
 
-        // Construct timestep_for_approximator_input_vec as per Python logic
-        int64_t batch_size = x->ne[3]; // Assuming batch size is the last dim of x (img_latent_tokens)
+        // Debug input tensor shapes using the same pattern as stable-diffusion.cpp
+        LOG_DEBUG(" Input tensor shapes:");
+        if (x) LOG_DEBUG("  x (img_latent_tokens) shape: %lld %lld %lld %lld, type: %s", x->ne[0], x->ne[1], x->ne[2], x->ne[3], ggml_type_name(x->type)); else LOG_DEBUG("  x (img_latent_tokens) is NULL");
+        if (timesteps) LOG_DEBUG("  timesteps shape: %lld %lld %lld %lld, type: %s", timesteps->ne[0], timesteps->ne[1], timesteps->ne[2], timesteps->ne[3], ggml_type_name(timesteps->type)); else LOG_DEBUG("  timesteps is NULL");
+        if (context) LOG_DEBUG("  context (txt_embeddings) shape: %lld %lld %lld %lld, type: %s", context->ne[0], context->ne[1], context->ne[2], context->ne[3], ggml_type_name(context->type)); else LOG_DEBUG("  context (txt_embeddings) is NULL");
+        if (y) LOG_DEBUG("  y (pe) shape: %lld %lld %lld %lld, type: %s", y->ne[0], y->ne[1], y->ne[2], y->ne[3], ggml_type_name(y->type)); else LOG_DEBUG("  y (pe) is NULL");
+        if (guidance) LOG_DEBUG("  guidance shape: %lld %lld %lld %lld, type: %s", guidance->ne[0], guidance->ne[1], guidance->ne[2], guidance->ne[3], ggml_type_name(guidance->type)); else LOG_DEBUG("  guidance is NULL");
+        if (c_concat) LOG_DEBUG("  c_concat (t5_padding_mask) shape: %lld %lld %lld %lld, type: %s", c_concat->ne[0], c_concat->ne[1], c_concat->ne[2], c_concat->ne[3], ggml_type_name(c_concat->type)); else LOG_DEBUG("  c_concat (t5_padding_mask) is NULL");
 
-        // 1. distill_timestep = timestep_embedding(timesteps, 16)
-        // raw_timesteps is expected to be a 1D tensor [N] or [1]. Extract the single float value.
-        std::vector<float> current_timestep_val = {ggml_get_f32_1d(timesteps, 0)};
-        struct ggml_tensor* distill_timestep_tensor = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, 16, batch_size);
-        set_timestep_embedding(current_timestep_val, distill_timestep_tensor, 16);
-        // Permute from [16, batch_size] to [batch_size, 16] to match Python's (batch_size, 16)
-        distill_timestep_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, distill_timestep_tensor, 1, 0, 2, 3));
-
-        // 2. distil_guidance = timestep_embedding(guidance, 16)
-        std::vector<float> current_guidance_val = {ggml_get_f32_1d(guidance, 0)};
-        struct ggml_tensor* distil_guidance_tensor = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, 16, batch_size);
-        set_timestep_embedding(current_guidance_val, distil_guidance_tensor, 16);
-        // Permute from [16, batch_size] to [batch_size, 16]
-        distil_guidance_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, distil_guidance_tensor, 1, 0, 2, 3));
-
-        // 3. modulation_index = timestep_embedding(torch.arange(mod_index_length), 32)
-        // mod_index_length is chroma.chroma_hyperparams.mod_vector_total_indices (344)
-        std::vector<float> arange_mod_index(chroma.chroma_hyperparams.mod_vector_total_indices);
-        for (int i = 0; i < chroma.chroma_hyperparams.mod_vector_total_indices; ++i) {
-            arange_mod_index[i] = (float)i;
+        // Extract scalar values from input tensors - safely
+        LOG_DEBUG(" Extracting scalar values from tensors");
+        float timestep_val = 0.0f;
+        float guidance_val = 0.0f;
+        
+        if (timesteps && timesteps->ne[0] > 0) {
+            timestep_val = ggml_get_f32_1d(timesteps, 0);
+            LOG_DEBUG("   timestep_val: %f", timestep_val);
+        } else {
+            LOG_DEBUG("   timestep_val: ERROR - invalid timesteps tensor");
         }
-        struct ggml_tensor* modulation_index_tensor = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, 32, chroma.chroma_hyperparams.mod_vector_total_indices);
-        set_timestep_embedding(arange_mod_index, modulation_index_tensor, 32);
-        // Permute from [32, mod_index_length] to [mod_index_length, 32] to match Python's (mod_index_length, 32)
-        modulation_index_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, modulation_index_tensor, 1, 0, 2, 3));
+        
+        if (guidance && guidance->ne[0] > 0) {
+            guidance_val = ggml_get_f32_1d(guidance, 0);
+            LOG_DEBUG("   guidance_val: %f", guidance_val);
+        } else {
+            LOG_DEBUG("   guidance_val: ERROR - invalid guidance tensor");
+        }
 
-        // 4. Broadcast modulation_index: unsqueeze(0).repeat(batch_size, 1, 1)
-        // From [mod_index_length, 32] to [batch_size, mod_index_length, 32]
-        // Reshape to [32, mod_index_length, 1] then repeat along batch dimension
-        modulation_index_tensor = ggml_reshape_3d(output_ctx, modulation_index_tensor, 32, chroma.chroma_hyperparams.mod_vector_total_indices, 1);
-        modulation_index_tensor = ggml_repeat(output_ctx, modulation_index_tensor, ggml_new_tensor_3d(output_ctx, GGML_TYPE_F32, 32, chroma.chroma_hyperparams.mod_vector_total_indices, batch_size));
-        // Permute back to [batch_size, mod_index_length, 32]
-        modulation_index_tensor = ggml_cont(output_ctx, ggml_permute(output_ctx, modulation_index_tensor, 2, 1, 0, 3));
+        LOG_DEBUG(" Forward to chroma model");
 
-        // 5. Concatenate distill_timestep and distil_guidance: torch.cat([distill_timestep, distil_guidance], dim=1)
-        // From [batch_size, 16] and [batch_size, 16] to [batch_size, 32]
-        struct ggml_tensor* combined_timestep_guidance = ggml_concat(output_ctx, distill_timestep_tensor, distil_guidance_tensor, 1);
-
-        // 6. Broadcast combined_timestep_guidance: unsqueeze(1).repeat(1, mod_index_length, 1)
-        // From [batch_size, 32] to [batch_size, mod_index_length, 32]
-        // Reshape to [32, 1, batch_size] then repeat along mod_index_length dimension
-        combined_timestep_guidance = ggml_reshape_3d(output_ctx, combined_timestep_guidance, 32, 1, batch_size);
-        combined_timestep_guidance = ggml_repeat(output_ctx, combined_timestep_guidance, ggml_new_tensor_3d(output_ctx, GGML_TYPE_F32, 32, chroma.chroma_hyperparams.mod_vector_total_indices, batch_size));
-        // Permute back to [batch_size, mod_index_length, 32]
-        combined_timestep_guidance = ggml_cont(output_ctx, ggml_permute(output_ctx, combined_timestep_guidance, 2, 1, 0, 3));
-
-        // 7. Final concatenation for input_vec: torch.cat([timestep_guidance, modulation_index], dim=-1)
-        // From [batch_size, mod_index_length, 32] and [batch_size, mod_index_length, 32] to [batch_size, mod_index_length, 64]
-        struct ggml_tensor* constructed_timestep_for_approximator_input_vec = ggml_concat(output_ctx, combined_timestep_guidance, modulation_index_tensor, 2);
-
+        // Pass raw values to ChromaRunner - all tensor construction happens in build_graph
         chroma.compute(n_threads,
-                       x, // img_latent_tokens
-                       constructed_timestep_for_approximator_input_vec, // constructed input_vec
-                       context, // txt_tokens (T5 embeddings)
-                       y, // pe (positional embeddings)
-                       c_concat, // t5_padding_mask
+                       x,           // img_latent_tokens
+                       context,     // txt_tokens (T5 embeddings)
+                       y,           // pe (positional embeddings)
+                       c_concat,    // t5_padding_mask
+                       timestep_val, // raw timestep value
+                       guidance_val, // raw guidance value
                        output,
                        output_ctx,
                        skip_layers);
+        
+        LOG_DEBUG(" Chroma compute completed successfully");
     }
 };
 

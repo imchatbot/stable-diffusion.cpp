@@ -571,7 +571,7 @@ public:
         if (sd_version_is_sd3(version)) {
             LOG_INFO("running in FLOW mode");
             denoiser = std::make_shared<DiscreteFlowDenoiser>();
-        } else if (sd_version_is_flux(version)) {
+        } else if (sd_version_is_flux(version) || sd_version_is_chroma(version)) {
             LOG_INFO("running in Flux FLOW mode");
             float shift = 1.0f;  // TODO: validate
             for (auto pair : model_loader.tensor_storages_types) {
@@ -919,7 +919,6 @@ public:
                 if (cond.c_concat) LOG_DEBUG("  cond.c_concat shape: %lld %lld %lld %lld, type: %s", cond.c_concat->ne[0], cond.c_concat->ne[1], cond.c_concat->ne[2], cond.c_concat->ne[3], ggml_type_name(cond.c_concat->type)); else LOG_DEBUG("  cond.c_concat is NULL");
                 if (cond.c_vector) LOG_DEBUG("  cond.c_vector shape: %lld %lld %lld %lld, type: %s", cond.c_vector->ne[0], cond.c_vector->ne[1], cond.c_vector->ne[2], cond.c_vector->ne[3], ggml_type_name(cond.c_vector->type)); else LOG_DEBUG("  cond.c_vector is NULL");
                 if (guidance_tensor) LOG_DEBUG("  guidance_tensor shape: %lld, type: %s", guidance_tensor->ne[0], ggml_type_name(guidance_tensor->type)); else LOG_DEBUG("  guidance_tensor is NULL");
-                // Remove the special case for Chroma - use standard DiffusionModel interface for ALL models
                 diffusion_model->compute(n_threads,
                                         noised_input,
                                         timesteps,
