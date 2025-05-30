@@ -239,36 +239,14 @@ struct ChromaModel : public DiffusionModel {
         if (y) LOG_DEBUG("  y (pe) shape: %lld %lld %lld %lld, type: %s", y->ne[0], y->ne[1], y->ne[2], y->ne[3], ggml_type_name(y->type)); else LOG_DEBUG("  y (pe) is NULL");
         if (guidance) LOG_DEBUG("  guidance shape: %lld %lld %lld %lld, type: %s", guidance->ne[0], guidance->ne[1], guidance->ne[2], guidance->ne[3], ggml_type_name(guidance->type)); else LOG_DEBUG("  guidance is NULL");
         if (c_concat) LOG_DEBUG("  c_concat (t5_padding_mask) shape: %lld %lld %lld %lld, type: %s", c_concat->ne[0], c_concat->ne[1], c_concat->ne[2], c_concat->ne[3], ggml_type_name(c_concat->type)); else LOG_DEBUG("  c_concat (t5_padding_mask) is NULL");
-
-        // Extract scalar values from input tensors - safely
-        LOG_DEBUG(" Extracting scalar values from tensors");
-        float timestep_val = 0.0f;
-        float guidance_val = 0.0f;
-        
-        if (timesteps && timesteps->ne[0] > 0) {
-            timestep_val = ggml_get_f32_1d(timesteps, 0);
-            LOG_DEBUG("   timestep_val: %f", timestep_val);
-        } else {
-            LOG_DEBUG("   timestep_val: ERROR - invalid timesteps tensor");
-        }
-        
-        if (guidance && guidance->ne[0] > 0) {
-            guidance_val = ggml_get_f32_1d(guidance, 0);
-            LOG_DEBUG("   guidance_val: %f", guidance_val);
-        } else {
-            LOG_DEBUG("   guidance_val: ERROR - invalid guidance tensor");
-        }
-
-        LOG_DEBUG(" Forward to chroma model");
-
         // Pass raw values to ChromaRunner - all tensor construction happens in build_graph
         chroma.compute(n_threads,
                        x,           // img_latent_tokens
                        context,     // txt_tokens (T5 embeddings)
                        y,           // pe (positional embeddings)
                        c_concat,    // t5_padding_mask
-                       timestep_val, // raw timestep value
-                       guidance_val, // raw guidance value
+                       timesteps, // raw timestep value
+                       guidance, // raw guidance value
                        output,
                        output_ctx,
                        skip_layers);
